@@ -1,0 +1,12 @@
+# Build output
+build/
+
+# Screenshots / scratch
+scratch/
+
+# Logs
+*.log
+err.log
+
+# macOS
+.DS_Store
