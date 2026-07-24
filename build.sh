@@ -8,6 +8,11 @@ BUILD_DIR="build"
 APP="$BUILD_DIR/$APP_NAME.app"
 BIN_NAME="TokenUsageIsland"
 
+# Version: explicit $VERSION, else the latest git tag (v1.2.3 -> 1.2.3), else a dev marker.
+VERSION="${VERSION:-$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || true)}"
+VERSION="${VERSION:-0.0.0-dev}"
+
+echo "▸ Building $APP_NAME $VERSION"
 echo "▸ Compiling…"
 rm -rf "$BUILD_DIR"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -31,8 +36,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleDisplayName</key><string>$APP_NAME</string>
     <key>CFBundleExecutable</key><string>$BIN_NAME</string>
     <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
-    <key>CFBundleVersion</key><string>1.0</string>
-    <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>CFBundleVersion</key><string>$VERSION</string>
+    <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>LSUIElement</key><true/>
@@ -44,4 +49,4 @@ PLIST
 echo "▸ Signing (ad-hoc)…"
 codesign --force --deep --sign - "$APP" 2>/dev/null || true
 
-echo "✓ Built: $APP"
+echo "✓ Built: $APP ($VERSION)"

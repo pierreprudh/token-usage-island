@@ -58,6 +58,18 @@ your Keychain. Nothing is sent anywhere else, and there is no telemetry.
 
 ## Install
 
+### Homebrew (recommended)
+
+```bash
+brew install --cask --no-quarantine pierreprudh/tap/token-usage-island
+open "/Applications/Token Usage Island.app"
+```
+
+`--no-quarantine` is required because the app is ad-hoc signed (not notarized with an Apple
+Developer ID); it tells Gatekeeper to trust the download.
+
+### From source
+
 ```bash
 git clone https://github.com/pierreprudh/token-usage-island.git
 cd token-usage-island
@@ -68,6 +80,9 @@ open "/Applications/Token Usage Island.app"
 
 On first launch macOS asks to allow reading the *"Claude Code-credentials"* Keychain item —
 choose **Always Allow**.
+
+> **Note:** the notch UI requires an Apple Silicon MacBook Pro; the app runs on any Mac
+> (macOS 14+) but falls back to a floating card on displays without a notch.
 
 **Launch at login:** System Settings → General → Login Items → **+** → *Token Usage Island*.
 
@@ -96,8 +111,24 @@ Sources/
   IslandView.swift  SwiftUI island — notch tab + light Control-Center card
   main.swift        AppKit panel, notch geometry, positioning
 Resources/          Provider logos (Claude, Codex, OpenCode)
-build.sh            Compile + bundle into a .app
+build.sh            Compile + bundle into a versioned .app
+.github/workflows/  release.yml — tag-triggered build + GitHub Release
 ```
+
+## Releasing
+
+Releases are cut by pushing a semver tag; a macOS GitHub Actions runner builds the app,
+zips it, and publishes a GitHub Release with the `.zip` and its SHA-256.
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+The workflow prints the cask `version`/`sha256` in its run summary. If a `TAP_TOKEN` repo
+secret (a PAT with `contents:write` on [`pierreprudh/homebrew-tap`](https://github.com/pierreprudh/homebrew-tap))
+is set, it also auto-bumps the cask so `brew upgrade` picks up the new build; otherwise paste
+those two values into `Casks/token-usage-island.rb` in the tap by hand.
 
 ---
 
