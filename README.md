@@ -24,8 +24,10 @@ with the notch. **Hover** it and the tab springs open to reveal your Claude sess
 weekly usage; **click** it and it expands into a light, Control-Center-style card with a
 full breakdown for all three tools.
 
-It's sized to Apple's real notch metrics (185 × 32 pt on the 14"/16" MacBook Pro) and adapts
-automatically when moved to a display without a notch.
+It sizes itself to **your Mac's actual notch** — read live from the display at launch
+(`safeAreaInsets` + the menu-bar auxiliary areas), so it fits the 14"/16" MacBook Pro and the
+13"/15" MacBook Air alike, and re-measures if you change display scaling or move it to a
+screen without a notch (where it falls back to a floating card).
 
 ## Features
 
@@ -113,6 +115,21 @@ Sources/
 Resources/          Provider logos (Claude, Codex, OpenCode)
 build.sh            Compile + bundle into a versioned .app
 .github/workflows/  release.yml — tag-triggered build + GitHub Release
+```
+
+## Testing across MacBooks
+
+The notch is measured live, but you can simulate any model on one machine via env vars
+(handy for checking the layout without the hardware):
+
+```bash
+# Named preset: air13 | mbp14 | air15 | mbp16
+TUI_SIMULATE=air13 "build/Token Usage Island.app/Contents/MacOS/TokenUsageIsland"
+
+# Or an explicit notch size in points
+TUI_NOTCH_W=170 TUI_NOTCH_H=38 ".../TokenUsageIsland"
+
+# Add TUI_PREVIEW=1 to open the lip + card at launch (for screenshots)
 ```
 
 ## Releasing

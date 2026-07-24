@@ -1,6 +1,7 @@
 import SwiftUI
 
-// Sizes derived from Apple's real notch metrics (185×32 pt on the 14"/16" MBP).
+// Notch metrics are read live per-display (see updateNotchGeometry); these are
+// only the size constants the layout adds on top of the measured notch.
 enum IslandSize {
     static let collapsedW: CGFloat = 150   // fallback width on non-notch displays
     static let lipHeight: CGFloat = 15     // summary strip below the notch line
@@ -8,6 +9,9 @@ enum IslandSize {
     static let gap: CGFloat = 7            // float gap between notch tab and card
     static let expandedW: CGFloat = 300
     static let cornerExpanded: CGFloat = 18
+    // Narrowest the revealed lip may be, so the logo + two stats never clip on the
+    // narrower Air notches. Wider notches (14"/16" MBP) keep their measured width.
+    static let minRevealW: CGFloat = 176
 }
 
 @MainActor
@@ -18,6 +22,8 @@ final class IslandState: ObservableObject {
     @Published var hasNotch = false
     @Published var notchWidth: CGFloat = 185
     @Published var notchHeight: CGFloat = 32
+    // QA only: force the lip/card open for screenshots (TUI_PREVIEW=1).
+    @Published var forceReveal = false
 }
 
 struct IslandView: View {
@@ -28,9 +34,13 @@ struct IslandView: View {
 
     @State private var hovered = false
 
-    private var tabWidth: CGFloat { state.hasNotch ? state.notchWidth : IslandSize.collapsedW }
+    // At rest the tab is exactly the measured notch so it disappears into it.
+    private var restTabWidth: CGFloat { state.hasNotch ? state.notchWidth : IslandSize.collapsedW }
     // Reveal the summary lip when hovered or open; at rest it's just the notch.
-    private var revealed: Bool { hovered || state.expanded }
+    private var revealed: Bool { hovered || state.expanded || state.forceReveal }
+    // When revealed, grow to at least minRevealW so content fits on narrow notches;
+    // on wide notches this is a no-op (max keeps the measured width).
+    private var tabWidth: CGFloat { revealed ? max(restTabWidth, IslandSize.minRevealW) : restTabWidth }
     private var baseTabHeight: CGFloat { state.hasNotch ? state.notchHeight : 20 }
     private var tabHeight: CGFloat { baseTabHeight + (revealed ? IslandSize.lipHeight : 0) }
 
@@ -75,6 +85,7 @@ struct IslandView: View {
                 }
             }
             .padding(.bottom, 2)
+            .fixedSize()   // keep intrinsic width; tabWidth guarantees room (never clips)
             .frame(height: IslandSize.lipHeight)
             .opacity(revealed ? 1 : 0)
         }

@@ -32,6 +32,35 @@ struct RootView: View {
     }
 }
 
+// Notch metrics for simulating other MacBooks on one machine, for testing the
+// per-model layout without the hardware. Real hardware always uses live
+// measurement; this only kicks in via env vars.
+//   TUI_SIMULATE=mbp14|mbp16|air13|air15   — named preset
+//   TUI_NOTCH_W=<pt> TUI_NOTCH_H=<pt>       — explicit override (takes precedence)
+enum NotchSim {
+    // Approximate point metrics at each model's default "looks like" resolution.
+    // Widths differ with scaling; heights (menu-bar/notch) are ~all the same.
+    static let presets: [String: (w: CGFloat, h: CGFloat)] = [
+        "air13": (170, 38),   // 13" MacBook Air (M2/M3) — narrowest notch
+        "mbp14": (184, 38),   // 14" MacBook Pro
+        "air15": (185, 38),   // 15" MacBook Air
+        "mbp16": (189, 38),   // 16" MacBook Pro — widest
+    ]
+
+    static func fromEnvironment() -> (width: CGFloat, height: CGFloat)? {
+        let env = ProcessInfo.processInfo.environment
+        var w: CGFloat?
+        var h: CGFloat?
+        if let name = env["TUI_SIMULATE"], let p = presets[name.lowercased()] {
+            w = p.w; h = p.h
+        }
+        if let s = env["TUI_NOTCH_W"], let v = Double(s) { w = CGFloat(v) }
+        if let s = env["TUI_NOTCH_H"], let v = Double(s) { h = CGFloat(v) }
+        guard let width = w else { return nil }
+        return (width, h ?? 38)
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let store = UsageStore()
@@ -73,6 +102,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.window = panel
 
         panel.orderFrontRegardless()
+
+        // QA: open the lip + card at launch so screenshots capture the full UI.
+        if ProcessInfo.processInfo.environment["TUI_PREVIEW"] == "1" {
+            state.forceReveal = true
+            state.expanded = true
+        }
 
         // Initial layout once SwiftUI has measured its content.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
@@ -122,16 +157,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // Read the active screen's real notch metrics into the view state.
+    // Works on any MacBook: the notch size comes from the OS, not a hardcoded model.
     func updateNotchGeometry() {
-        guard let screen = targetScreen() else { return }
-        if #available(macOS 12.0, *),
-           screen.safeAreaInsets.top > 0,
-           let l = screen.auxiliaryTopLeftArea, let r = screen.auxiliaryTopRightArea {
+        // Testing hook: simulate another MacBook without its hardware.
+        if let sim = NotchSim.fromEnvironment() {
             state.hasNotch = true
-            state.notchWidth = screen.frame.width - l.width - r.width
-            state.notchHeight = screen.safeAreaInsets.top
-        } else {
+            state.notchWidth = sim.width
+            state.notchHeight = sim.height
+            return
+        }
+
+        guard let screen = targetScreen() else { return }
+        guard #available(macOS 12.0, *), screen.safeAreaInsets.top > 0 else {
             state.hasNotch = false
+            return
+        }
+
+        // A notch is present. Height is the safe-area inset; width is the gap between
+        // the two menu-bar auxiliary areas.
+        state.hasNotch = true
+        state.notchHeight = screen.safeAreaInsets.top
+        if let l = screen.auxiliaryTopLeftArea, let r = screen.auxiliaryTopRightArea {
+            state.notchWidth = screen.frame.width - l.width - r.width
+        } else {
+            // Notch reported but the aux areas are unavailable — estimate from screen
+            // width rather than mis-detecting the Mac as notchless.
+            state.notchWidth = min(200, max(160, screen.frame.width * 0.12))
         }
     }
 
@@ -167,13 +218,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let h = currentSize.height
         let x = screen.frame.midX - w / 2
         // Anchor the top just under the menu bar. On a notched Mac this hugs the
-        // notch; otherwise it hangs cleanly below the menu bar.
-        let hasNotch: Bool = {
-            if #available(macOS 12.0, *) { return screen.safeAreaInsets.top > 0 }
-            return false
-        }()
+        // notch; otherwise it hangs cleanly below the menu bar. Use the same
+        // notch verdict the view uses so tab and window always agree.
         let menuBarH = screen.frame.maxY - screen.visibleFrame.maxY
-        let topAnchor = hasNotch ? screen.frame.maxY : (screen.frame.maxY - menuBarH + 2)
+        let topAnchor = state.hasNotch ? screen.frame.maxY : (screen.frame.maxY - menuBarH + 2)
         let y = topAnchor - h
         let frame = NSRect(x: x, y: y, width: w, height: h)
         if animated {
