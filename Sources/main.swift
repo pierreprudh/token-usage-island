@@ -61,10 +61,75 @@ enum NotchSim {
     }
 }
 
+// Auto-detected MacBook model + its notch metrics. Live screen measurement is
+// still preferred (it tracks display scaling); this is the labelled fallback and
+// a launch-time diagnostic so we can confirm handling on each machine.
+struct MacModel {
+    let id: String          // e.g. "Mac15,3"
+    let name: String        // e.g. "MacBook Pro 14\""
+    let notch: (w: CGFloat, h: CGFloat)?   // nil = no notch (or unknown)
+
+    static func detect() -> MacModel {
+        let id = Self.hardwareID()
+        if let m = Self.table[id] { return MacModel(id: id, name: m.name, notch: m.notch) }
+        // Unknown id: guess family from the identifier so new models still work.
+        let name = id.contains("Air") || id.hasPrefix("Mac16,12") || id.hasPrefix("Mac16,13")
+            ? "MacBook Air" : (id.contains("Pro") ? "MacBook Pro" : id)
+        return MacModel(id: id, name: name, notch: nil)
+    }
+
+    private static func hardwareID() -> String {
+        var size = 0
+        sysctlbyname("hw.model", nil, &size, nil, 0)
+        guard size > 0 else { return "unknown" }
+        var buf = [CChar](repeating: 0, count: size)
+        sysctlbyname("hw.model", &buf, &size, nil, 0)
+        return String(cString: buf)
+    }
+
+    // Notched MacBooks. Widths are point metrics at the default "looks like"
+    // resolution; heights (~menu-bar) are near-constant. Best-effort — a missing
+    // future model just falls back to live measurement, which is authoritative.
+    private static let table: [String: (name: String, notch: (w: CGFloat, h: CGFloat)?)] = [
+        // 14"/16" MacBook Pro — 2021 (M1 Pro/Max)
+        "MacBookPro18,3": ("MacBook Pro 14\"", (184, 38)),
+        "MacBookPro18,4": ("MacBook Pro 14\"", (184, 38)),
+        "MacBookPro18,1": ("MacBook Pro 16\"", (189, 38)),
+        "MacBookPro18,2": ("MacBook Pro 16\"", (189, 38)),
+        // 14"/16" MacBook Pro — 2023 (M2 Pro/Max)
+        "Mac14,5":  ("MacBook Pro 14\"", (184, 38)),
+        "Mac14,9":  ("MacBook Pro 14\"", (184, 38)),
+        "Mac14,6":  ("MacBook Pro 16\"", (189, 38)),
+        "Mac14,10": ("MacBook Pro 16\"", (189, 38)),
+        // 14"/16" MacBook Pro — late 2023 (M3 family)
+        "Mac15,3":  ("MacBook Pro 14\"", (184, 38)),
+        "Mac15,6":  ("MacBook Pro 14\"", (184, 38)),
+        "Mac15,8":  ("MacBook Pro 14\"", (184, 38)),
+        "Mac15,10": ("MacBook Pro 14\"", (184, 38)),
+        "Mac15,7":  ("MacBook Pro 16\"", (189, 38)),
+        "Mac15,9":  ("MacBook Pro 16\"", (189, 38)),
+        "Mac15,11": ("MacBook Pro 16\"", (189, 38)),
+        // 14"/16" MacBook Pro — 2024 (M4 family)
+        "Mac16,1":  ("MacBook Pro 14\"", (184, 38)),
+        "Mac16,6":  ("MacBook Pro 14\"", (184, 38)),
+        "Mac16,8":  ("MacBook Pro 14\"", (184, 38)),
+        "Mac16,5":  ("MacBook Pro 16\"", (189, 38)),
+        "Mac16,7":  ("MacBook Pro 16\"", (189, 38)),
+        // MacBook Air 13"/15" — M2/M3/M4 (narrower notch)
+        "Mac14,2":  ("MacBook Air 13\"", (170, 38)),
+        "Mac14,15": ("MacBook Air 15\"", (185, 38)),
+        "Mac15,12": ("MacBook Air 13\"", (170, 38)),
+        "Mac15,13": ("MacBook Air 15\"", (185, 38)),
+        "Mac16,12": ("MacBook Air 13\"", (170, 38)),
+        "Mac16,13": ("MacBook Air 15\"", (185, 38)),
+    ]
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let store = UsageStore()
     let state = IslandState()
+    let model = MacModel.detect()
     var window: NSPanel!
     var hosting: NSHostingView<RootView>!
     var bag = Set<AnyCancellable>()
@@ -179,10 +244,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state.notchHeight = screen.safeAreaInsets.top
         if let l = screen.auxiliaryTopLeftArea, let r = screen.auxiliaryTopRightArea {
             state.notchWidth = screen.frame.width - l.width - r.width
+            NSLog("[TokenUsageIsland] \(model.name) (\(model.id)) — notch \(Int(state.notchWidth))×\(Int(state.notchHeight)) (measured)")
+        } else if let n = model.notch {
+            // Aux areas unavailable — use the detected model's known width.
+            state.notchWidth = n.w
+            NSLog("[TokenUsageIsland] \(model.name) (\(model.id)) — notch \(Int(n.w))×\(Int(state.notchHeight)) (model fallback)")
         } else {
-            // Notch reported but the aux areas are unavailable — estimate from screen
-            // width rather than mis-detecting the Mac as notchless.
+            // Unknown model with a notch — estimate from screen width.
             state.notchWidth = min(200, max(160, screen.frame.width * 0.12))
+            NSLog("[TokenUsageIsland] \(model.id) — notch \(Int(state.notchWidth))×\(Int(state.notchHeight)) (estimated)")
         }
     }
 
