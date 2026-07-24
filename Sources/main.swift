@@ -107,9 +107,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
             object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in
-                self?.updateNotchGeometry()
-                self?.layoutFromHosting()
+            // Observer already runs on the main queue; bind a strong `self` so the
+            // hop below captures an immutable let (portable across Swift toolchains).
+            guard let self else { return }
+            DispatchQueue.main.async {
+                self.updateNotchGeometry()
+                self.layoutFromHosting()
             }
         }
     }
