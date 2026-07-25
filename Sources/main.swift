@@ -134,6 +134,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var hosting: NSHostingView<RootView>!
     var bag = Set<AnyCancellable>()
     var currentSize: CGSize = .zero
+    // The panel is created off-screen and only shown once positioned at the notch,
+    // so it never appears to travel up from the bottom-left on launch.
+    var didAppear = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -166,7 +169,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.contentView = hosting
         self.window = panel
 
-        panel.orderFrontRegardless()
+        // NB: no orderFront here — the first successful reposition() reveals the
+        // panel once it's already sitting at the notch (see didAppear), so it
+        // never flashes at the bottom-left default position and travels up.
 
         // QA: open the lip + card at launch so screenshots capture the full UI.
         if ProcessInfo.processInfo.environment["TUI_PREVIEW"] == "1" {
@@ -294,6 +299,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let topAnchor = state.hasNotch ? screen.frame.maxY : (screen.frame.maxY - menuBarH + 2)
         let y = topAnchor - h
         let frame = NSRect(x: x, y: y, width: w, height: h)
+        if !didAppear {
+            // First real layout: snap straight to the notch (no animation) and only
+            // then reveal the panel, so launch is a clean spawn in place.
+            window.setFrame(frame, display: true)
+            window.orderFrontRegardless()
+            didAppear = true
+            return
+        }
         if animated {
             NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = 0.30

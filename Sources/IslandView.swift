@@ -24,6 +24,8 @@ final class IslandState: ObservableObject {
     @Published var notchHeight: CGFloat = 32
     // QA only: force the lip/card open for screenshots (TUI_PREVIEW=1).
     @Published var forceReveal = false
+    // One-shot launch greeting: the tab reveals, plays a loading bar, then settles.
+    @Published var launching = false
 }
 
 struct IslandView: View {
@@ -33,11 +35,13 @@ struct IslandView: View {
     var onRefresh: () -> Void
 
     @State private var hovered = false
+    @State private var launchBar: CGFloat = 0   // 0→1 fill for the launch loading bar
+    @State private var didGreet = false
 
     // At rest the tab is exactly the measured notch so it disappears into it.
     private var restTabWidth: CGFloat { state.hasNotch ? state.notchWidth : IslandSize.collapsedW }
     // Reveal the summary lip when hovered or open; at rest it's just the notch.
-    private var revealed: Bool { hovered || state.expanded || state.forceReveal }
+    private var revealed: Bool { hovered || state.expanded || state.forceReveal || state.launching }
     // When revealed, grow to at least minRevealW so content fits on narrow notches;
     // on wide notches this is a no-op (max keeps the measured width).
     private var tabWidth: CGFloat { revealed ? max(restTabWidth, IslandSize.minRevealW) : restTabWidth }
@@ -78,10 +82,17 @@ struct IslandView: View {
         ZStack(alignment: .bottom) {
             Color.black
             HStack(spacing: 9) {
-                logo("claude", 11, onLight: false)
-                HStack(spacing: 11) {
-                    lipStat("5h", store.claudePercent("Session"))
-                    lipStat("7d", store.claudePercent("Weekly"))
+                if state.launching {
+                    // Launch greeting: all three provider marks + the loading bar.
+                    trioLogos(13)
+                    launchLoadingBar
+                } else {
+                    // Hover: Claude only.
+                    logo("claude", 11, onLight: false)
+                    HStack(spacing: 11) {
+                        lipStat("5h", store.claudePercent("Session"))
+                        lipStat("7d", store.claudePercent("Weekly"))
+                    }
                 }
             }
             .padding(.bottom, 2)
@@ -94,6 +105,66 @@ struct IslandView: View {
         .scaleEffect(hovered && !state.expanded ? 1.03 : 1.0, anchor: .top)
         .contentShape(Rectangle())
         .onTapGesture { state.expanded.toggle() }
+        .onAppear(perform: playLaunchGreeting)
+    }
+
+    // The three provider marks overlapping like linked rings. Each sits in a black
+    // circular container that blends into the notch (a "hidden" container), so the
+    // front chip cleanly cuts the one behind — a faint ring defines the overlap edge.
+    private func trioLogos(_ size: CGFloat) -> some View {
+        let d = size * 1.2   // chip diameter — hugs the logo tightly
+        return HStack(spacing: -d * 0.42) {
+            chip("claude", size, d).zIndex(3)
+            chip("codex", size, d).zIndex(2)
+            chip("opencode", size, d).zIndex(1)
+        }
+    }
+
+    private func chip(_ key: String, _ size: CGFloat, _ d: CGFloat) -> some View {
+        logo(key, size, onLight: false)
+            .frame(width: d, height: d)
+            .background(Circle().fill(Color.black))
+            .clipShape(Circle())
+    }
+
+    // A glassy launch "loading" cue: a frosted track with a glossy white fill that
+    // catches a top sheen and casts a soft luminous glow — Apple-style glassmorphism.
+    private var launchLoadingBar: some View {
+        let w: CGFloat = 92, h: CGFloat = 4
+        return Capsule()
+            .fill(.ultraThinMaterial)                                   // frosted glass track
+            .overlay(Capsule().strokeBorder(.white.opacity(0.14), lineWidth: 0.5))
+            .frame(width: w, height: h)
+            .overlay(alignment: .leading) {
+                Capsule()
+                    .fill(LinearGradient(                               // glossy fill
+                        colors: [.white, .white.opacity(0.78)],
+                        startPoint: .top, endPoint: .bottom))
+                    .frame(width: w * launchBar, height: h)
+                    .overlay(alignment: .top) {                         // top sheen highlight
+                        Capsule()
+                            .fill(LinearGradient(
+                                colors: [.white.opacity(0.9), .clear],
+                                startPoint: .top, endPoint: .center))
+                    }
+                    .clipShape(Capsule())
+                    .shadow(color: .white.opacity(0.55), radius: 4)     // soft luminous glow
+            }
+    }
+
+    // One-shot: settle in place, spring the lip open with a little overgrow while a
+    // loading bar sweeps, then collapse back into the notch. Skips during QA preview,
+    // and won't fight the user if they hover/click mid-greeting.
+    private func playLaunchGreeting() {
+        guard !didGreet, !state.forceReveal else { return }
+        didGreet = true
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 320_000_000)
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.52)) { state.launching = true }
+            withAnimation(.easeInOut(duration: 0.75)) { launchBar = 1 }
+            try? await Task.sleep(nanoseconds: 1_100_000_000)
+            withAnimation(.spring(response: 0.40, dampingFraction: 0.72)) { state.launching = false }
+        }
     }
 
     // MARK: Light Control-Center card
