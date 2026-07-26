@@ -65,6 +65,7 @@ struct IslandView: View {
     @State private var pulseStrength: CGFloat = 0   // 0 none · 0.5 amber · 1 red
     @State private var milestoneLogo = "claude" // which provider's mark to showcase
     @State private var loginEnabled = false     // reflects SMAppService login-item state
+    @StateObject private var history = History() // 24h trend, recorded from store.tools
 
     // At rest the tab is exactly the measured notch so it disappears into it.
     private var restTabWidth: CGFloat { state.hasNotch ? state.notchWidth : IslandSize.collapsedW }
@@ -101,6 +102,9 @@ struct IslandView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        // Log each fresh reading into the 24h trend. Decoupled from the fetchers —
+        // we just observe the published tools, so polling code stays untouched.
+        .onReceive(store.$tools) { history.record($0, at: Date()) }
     }
 
     // MARK: Notch tab — invisible at rest (blends with the notch), reveals on hover
@@ -301,7 +305,7 @@ struct IslandView: View {
                 if idx > 0 {
                     Divider().padding(.horizontal, 15)
                 }
-                ToolRow(tool: tool)
+                ToolRow(tool: tool, history: history)
             }
 
             HStack(spacing: 6) {
@@ -422,6 +426,7 @@ func logo(_ key: String, _ size: CGFloat, onLight: Bool) -> some View {
 
 struct ToolRow: View {
     let tool: Tool
+    @ObservedObject var history: History
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -450,7 +455,8 @@ struct ToolRow: View {
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(tool.metrics) { m in
-                        MetricRow(metric: m, accent: tool.accent)
+                        MetricRow(metric: m, accent: tool.accent,
+                                  trend: history.values(tool: tool.name, label: m.label))
                     }
                 }
             }
@@ -465,6 +471,7 @@ struct ToolRow: View {
 struct MetricRow: View {
     let metric: Metric
     let accent: Color
+    var trend: [Double] = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3.5) {
@@ -493,6 +500,12 @@ struct MetricRow: View {
                         }
                 }
                 .frame(height: 4.5)
+            }
+            // 24h trend — only once there are at least two readings to connect.
+            if trend.count >= 2 {
+                Sparkline(values: trend, accent: accent)
+                    .frame(height: 12)
+                    .padding(.top, 1)
             }
         }
     }

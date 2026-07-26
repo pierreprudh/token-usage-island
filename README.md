@@ -96,7 +96,8 @@ choose **Always Allow**.
 > **Note:** the notch UI requires an Apple Silicon MacBook Pro; the app runs on any Mac
 > (macOS 14+) but falls back to a floating card on displays without a notch.
 
-**Launch at login:** System Settings → General → Login Items → **+** → *Token Usage Island*.
+**Launch at login:** open the card and toggle **Open at login** in the footer. (No need to
+dig through System Settings — it registers the app via `SMAppService`.)
 
 ## Usage
 
@@ -110,6 +111,10 @@ choose **Always Allow**.
 
 ## Notes
 
+- **24h trend** — each metric shows a small sparkline of the last 24 hours under its bar,
+  so you can see whether you're climbing toward the cap. Readings are stored in
+  `~/Library/Application Support/Token Usage Island/history.json` and appear once there are
+  at least two data points.
 - **Codex** reflects your most recent Codex session — its limits are read from local logs,
   which only update when Codex talks to its server.
 - The Claude usage endpoint is rate-limited; a transient failure keeps the last good reading
