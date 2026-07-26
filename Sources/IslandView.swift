@@ -65,6 +65,8 @@ struct IslandView: View {
     @State private var pulseStrength: CGFloat = 0   // 0 none · 0.5 amber · 1 red
     @State private var milestoneLogo = "claude" // which provider's mark to showcase
     @State private var loginEnabled = false     // reflects SMAppService login-item state
+    @State private var draggingTool: Tool?      // the row being drag-reordered, if any
+    @State private var rowFrames: [UUID: CGRect] = [:]   // each row's slot, for drag hit-testing
 
     // At rest the tab is exactly the measured notch so it disappears into it.
     private var restTabWidth: CGFloat { state.hasNotch ? state.notchWidth : IslandSize.collapsedW }
@@ -81,20 +83,23 @@ struct IslandView: View {
             notchTab
             if state.expanded {
                 menuCard
-                    .transition(.asymmetric(
-                        insertion: .scale(scale: 0.94, anchor: .top).combined(with: .opacity),
-                        removal: .opacity))
+                    .transition(.cardUnfold)
             }
         }
-        .animation(.spring(response: 0.34, dampingFraction: 0.82), value: state.expanded)
+        // A springier, lightly-underdamped curve so the card unfolds out of the tab
+        // with a little organic overshoot instead of a flat fade. The window height
+        // tracks this same animation (see updateWindowSize), so tab + card read as one
+        // piece morphing open from the top.
+        .animation(.spring(response: 0.40, dampingFraction: 0.70), value: state.expanded)
         .onHover { hovering in
             // Always keep `hovered` in sync — otherwise it sticks `true` after the
             // card closes and the lip never retracts until a second hover cycle.
             withAnimation(.spring(response: 0.30, dampingFraction: 0.52)) {
                 hovered = hovering
             }
-            // Leaving an open (unpinned) card collapses it back to the lip.
-            if state.expanded && !hovering && !state.pinned {
+            // Leaving an open (unpinned) card collapses it back to the lip — unless a
+            // row is mid-drag, where the pointer may briefly stray outside the bounds.
+            if state.expanded && !hovering && !state.pinned && draggingTool == nil {
                 withAnimation(.spring(response: 0.32, dampingFraction: 0.7)) {
                     state.expanded = false
                 }
@@ -104,7 +109,8 @@ struct IslandView: View {
         // `.onHover` above miss its exit, leaving the lip stuck open. This fires a
         // definitive `.ended` when the pointer truly leaves, so we always retract.
         .onContinuousHover { phase in
-            if case .ended = phase {
+            // Ignore exits while a row is being dragged — the drag owns the pointer.
+            if case .ended = phase, draggingTool == nil {
                 withAnimation(.spring(response: 0.30, dampingFraction: 0.52)) {
                     hovered = false
                 }
@@ -123,22 +129,27 @@ struct IslandView: View {
     private var notchTab: some View {
         ZStack(alignment: .bottom) {
             Color.black
-            HStack(spacing: 9) {
-                if state.launching {
-                    // Launch greeting: all three provider marks + the loading bar.
+            // The three lip contents are layered and cross-faded by explicit opacity
+            // rather than swapped via if/else. An animated if/else lets SwiftUI
+            // cross-fade the *outgoing* branch, so the hover stats used to bleed through
+            // while the launch greeting was revealing. Gating each layer's opacity keeps
+            // exactly one visible at a time — the hover lip is pinned off whenever a
+            // greeting or milestone owns the tab.
+            ZStack {
+                // Hover: the top-ordered provider's mark + its headline stats.
+                hoverLip
+                    .opacity(revealed && !state.launching && !(state.celebrating && !state.expanded) ? 1 : 0)
+
+                // Launch greeting: all three provider marks + the loading bar.
+                HStack(spacing: 9) {
                     trioLogos(13)
                     launchLoadingBar
-                } else if state.celebrating && !state.expanded {
-                    // Milestone: showcase the crossed number (yields to an open card).
-                    milestoneLip
-                } else {
-                    // Hover: Claude only.
-                    logo("claude", 11, onLight: false)
-                    HStack(spacing: 11) {
-                        lipStat("5h", store.claudePercent("Session"))
-                        lipStat("7d", store.claudePercent("Weekly"))
-                    }
                 }
+                .opacity(state.launching ? 1 : 0)
+
+                // Milestone: showcase the crossed number (yields to an open card).
+                milestoneLip
+                    .opacity(state.celebrating && !state.expanded && !state.launching ? 1 : 0)
             }
             .padding(.bottom, 2)
             .fixedSize()   // keep intrinsic width; tabWidth guarantees room (never clips)
@@ -155,7 +166,10 @@ struct IslandView: View {
         .scaleEffect(x: milestoneShow ? 1.0 : (state.celebrating ? 0.97 : 1.0),
                      y: milestoneShow ? 1.0 : (state.celebrating ? 1.05 : 1.0),
                      anchor: .top)
-        .scaleEffect(hovered && !state.expanded ? 1.03 : 1.0, anchor: .top)
+        // Tab lifts a touch on hover, but the lift is tied to `hovered` alone — NOT to
+        // `expanded` — so clicking to open the card doesn't snap the tab back down. The
+        // island stays put while the card unfolds beneath it.
+        .scaleEffect(hovered ? 1.03 : 1.0, anchor: .top)
         .contentShape(Rectangle())
         .onTapGesture { state.expanded.toggle() }
         .onAppear(perform: playLaunchGreeting)
@@ -312,11 +326,21 @@ struct IslandView: View {
             .padding(.top, 13)
             .padding(.bottom, 10)
 
+            // Drag any row to reorder the providers; the one on top drives the hover
+            // lip. A DragGesture (not `.onDrag`) does the reordering — the notch panel
+            // is a borderless non-activating window, so AppKit's native drag session
+            // never starts, but SwiftUI gestures fire the same as the tap does.
             ForEach(Array(store.tools.enumerated()), id: \.element.id) { idx, tool in
                 if idx > 0 {
                     Divider().padding(.horizontal, 15)
                 }
-                ToolRow(tool: tool)
+                ToolRow(tool: tool, dragging: draggingTool?.id == tool.id)
+                    .background(GeometryReader { geo in
+                        Color.clear.preference(key: RowFrameKey.self,
+                                               value: [tool.id: geo.frame(in: .named("reorder"))])
+                    })
+                    .zIndex(draggingTool?.id == tool.id ? 1 : 0)
+                    .gesture(reorderGesture(tool))
             }
 
             HStack(spacing: 6) {
@@ -343,6 +367,9 @@ struct IslandView: View {
             .onAppear { loginEnabled = LoginItem.enabled }
         }
         .frame(width: IslandSize.expandedW)
+        // Rows report their frames here so the drag can tell which slot the pointer is over.
+        .coordinateSpace(name: "reorder")
+        .onPreferenceChange(RowFrameKey.self) { rowFrames = $0 }
         .background(.thickMaterial, in: RoundedRectangle(cornerRadius: IslandSize.cornerExpanded, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: IslandSize.cornerExpanded, style: .continuous)
@@ -351,6 +378,34 @@ struct IslandView: View {
         // No forced colorScheme — the card inherits the system appearance so it
         // matches whatever light/dark theme the Mac is currently using.
         .shadow(color: .black.opacity(0.28), radius: 16, y: 8)
+    }
+
+    // Live row reorder. While a row is dragged we swap it into whichever slot the
+    // pointer is over (the array move animates the hop); nothing touches the network,
+    // and the new order is persisted only when the drag ends.
+    private func reorderGesture(_ tool: Tool) -> some Gesture {
+        DragGesture(minimumDistance: 6, coordinateSpace: .named("reorder"))
+            .onChanged { value in
+                if draggingTool == nil { draggingTool = tool }
+                guard let drag = draggingTool else { return }
+                let y = value.location.y
+                // The row the pointer currently sits over (skip the one being dragged).
+                guard let target = store.tools.first(where: { t in
+                        guard t.id != drag.id, let f = rowFrames[t.id] else { return false }
+                        return y >= f.minY && y <= f.maxY
+                      }),
+                      let from = store.tools.firstIndex(where: { $0.id == drag.id }),
+                      let to = store.tools.firstIndex(where: { $0.id == target.id })
+                else { return }
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+                    store.tools.move(fromOffsets: IndexSet(integer: from),
+                                     toOffset: to > from ? to + 1 : to)
+                }
+            }
+            .onEnded { _ in
+                if draggingTool != nil { store.persistOrder() }
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) { draggingTool = nil }
+            }
     }
 
     // Footer control: one click registers/unregisters the login item. Only flips the
@@ -375,14 +430,48 @@ struct IslandView: View {
         .help(loginEnabled ? "Won't open automatically" : "Open automatically when you log in")
     }
 
+    // The hover lip content: the provider the user dragged to the top, with its own
+    // mark, accent and headline numbers. Providers without a percentage (pay-as-you-go)
+    // fall back to their compact cost detail so the lip is never blank.
+    @ViewBuilder
+    private var hoverLip: some View {
+        if let top = store.tools.first {
+            HStack(spacing: 9) {
+                logo(top.logoKey, 11, onLight: false)
+                let pctMetrics = top.metrics.filter { $0.percent != nil }
+                if pctMetrics.isEmpty {
+                    Text(top.metrics.first?.detail.components(separatedBy: " · ").first ?? "—")
+                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.85))
+                } else {
+                    HStack(spacing: 11) {
+                        ForEach(pctMetrics.prefix(2)) { m in
+                            lipStat(shortLabel(m.label), m.percent, accent: top.accent)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Compress a metric's full label to the two-or-three-character tag the lip shows.
+    private func shortLabel(_ label: String) -> String {
+        let l = label.lowercased()
+        if l.contains("weekly") || l.contains("7d") || l.contains("week") { return "7d" }
+        if l.contains("5h") || l.contains("session") { return "5h" }
+        if l.contains("secondary") { return "2nd" }
+        if l.contains("limit") { return "lim" }
+        return String(label.prefix(3)).lowercased()
+    }
+
     // A compact stat for the hover lip: percentage first, faint time label after ("12% 5h").
     @ViewBuilder
-    private func lipStat(_ label: String, _ pct: Double?) -> some View {
+    private func lipStat(_ label: String, _ pct: Double?, accent: Color) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 2.5) {
             if let p = pct {
                 Text("\(Int(p.rounded()))%")
                     .font(.system(size: 11.5, weight: .semibold, design: .rounded))
-                    .foregroundStyle(barColor(p, accent: CLAUDE_ACCENT))
+                    .foregroundStyle(barColor(p, accent: accent))
             } else {
                 Text("—")
                     .font(.system(size: 11.5, weight: .semibold))
@@ -396,6 +485,26 @@ struct IslandView: View {
 
     private func timeString(_ d: Date) -> String {
         let f = DateFormatter(); f.dateFormat = "HH:mm"; return f.string(from: d)
+    }
+}
+
+// The menu card unfolds downward out of the tab: it grows from zero height pinned
+// at its top edge — so it appears to extrude from the notch — while a slight
+// horizontal give and a quick opacity fade keep it feeling soft rather than
+// mechanical. Paired with the window height tracking the content, the card is also
+// revealed top-down by the growing frame, so the two read as one morph from the top.
+private struct CardUnfold: ViewModifier {
+    let p: CGFloat   // 0 = folded into the tab · 1 = fully open
+    func body(content: Content) -> some View {
+        content
+            .scaleEffect(x: 0.92 + 0.08 * p, y: p, anchor: .top)
+            .opacity(Double(min(1, p * 1.8)))
+    }
+}
+
+extension AnyTransition {
+    static var cardUnfold: AnyTransition {
+        .modifier(active: CardUnfold(p: 0), identity: CardUnfold(p: 1))
     }
 }
 
@@ -440,6 +549,7 @@ func logo(_ key: String, _ size: CGFloat, onLight: Bool) -> some View {
 
 struct ToolRow: View {
     let tool: Tool
+    var dragging: Bool = false
     @Environment(\.colorScheme) private var colorScheme
     @State private var hovered = false
 
@@ -457,6 +567,11 @@ struct ToolRow: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)
+                // Grip affordance: fades in on hover to signal the row is draggable.
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .opacity(hovered ? 0.55 : 0)
             }
 
             if let err = tool.failed {
@@ -474,11 +589,23 @@ struct ToolRow: View {
         .fixedSize(horizontal: false, vertical: true)
         .frame(maxWidth: .infinity, alignment: .leading)
         // On-hover: the row grows a touch — a smooth size cue, no colour fill.
-        .scaleEffect(hovered ? 1.04 : 1.0)
+        // While dragged it lifts a little more and casts a soft shadow, so the row
+        // reads as picked-up as it hops between slots.
+        .scaleEffect(dragging ? 1.05 : (hovered ? 1.04 : 1.0))
+        .shadow(color: .black.opacity(dragging ? 0.22 : 0), radius: 8, y: 4)
         .contentShape(Rectangle())
         .onHover { h in
             withAnimation(.spring(response: 0.32, dampingFraction: 0.7)) { hovered = h }
         }
+    }
+}
+
+// Each provider row publishes its frame (in the card's "reorder" space) so the drag
+// gesture can tell which slot the pointer is hovering. Frames merge into one dict.
+struct RowFrameKey: PreferenceKey {
+    static var defaultValue: [UUID: CGRect] = [:]
+    static func reduce(value: inout [UUID: CGRect], nextValue: () -> [UUID: CGRect]) {
+        value.merge(nextValue()) { _, new in new }
     }
 }
 

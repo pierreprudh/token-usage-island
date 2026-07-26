@@ -67,6 +67,12 @@ final class UsageStore: ObservableObject {
     @Published var tools: [Tool] = []
     @Published var lastUpdated: Date?
     @Published var loading = false
+
+    // User-defined provider order (by tool name). The provider on top is the one
+    // surfaced in the hover lip. Persisted so a drag-reorder survives relaunch.
+    private static let orderKey = "toolOrder"
+    private var order: [String] = UserDefaults.standard.stringArray(forKey: UsageStore.orderKey)
+        ?? ["Claude", "Codex", "OpenCode"]
     // Set whenever the headline percent crosses a new 10% band upward. The view
     // observes this to play the milestone pulse.
     @Published var milestone: MilestoneEvent?
@@ -97,6 +103,21 @@ final class UsageStore: ObservableObject {
     private let minSpacing: TimeInterval = 30
     private var rlStrikes = 0
     private let coolDowns: [TimeInterval] = [45, 120, 300, 900, 1800]
+
+    // Sort `tools` into the user's saved order. Names not in the order list keep
+    // their fetch position at the end, so a newly-added provider still appears.
+    private func applyOrder() {
+        tools.sort {
+            (order.firstIndex(of: $0.name) ?? .max) < (order.firstIndex(of: $1.name) ?? .max)
+        }
+    }
+
+    // Persist the current on-screen order after a drag reorder, and re-sort so the
+    // next refresh keeps it. Call this once the drop settles.
+    func persistOrder() {
+        order = tools.map { $0.name }
+        UserDefaults.standard.set(order, forKey: Self.orderKey)
+    }
 
     // A specific Claude metric percent (e.g. "Session", "Weekly").
     func claudePercent(_ needle: String) -> Double? {
@@ -140,6 +161,7 @@ final class UsageStore: ObservableObject {
             // Fall back to the last good reading if we have one.
             return lastGood[t.name] ?? t
         }
+        applyOrder()
         self.lastUpdated = Date()
         self.loading = false
 
