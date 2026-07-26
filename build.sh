@@ -77,7 +77,9 @@ HELP
 
 case "\${1:-island}" in
   island|start|open|"")
-    open -a "\$APP" ;;
+    # -g: launch WITHOUT foreground-activating. The app lives in the notch and never
+    # wants app focus; activating it makes WindowServer flash the Spaces bar on launch.
+    open -g -a "\$APP" ;;
   quit|stop|off)
     # Graceful quit, then force-kill any survivor. osascript can return 0 without
     # actually quitting an app that only just launched, so we always mop up.

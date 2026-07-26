@@ -86,11 +86,10 @@ struct IslandView: View {
                     .transition(.cardUnfold)
             }
         }
-        // A springier, lightly-underdamped curve so the card unfolds out of the tab
-        // with a little organic overshoot instead of a flat fade. The window height
-        // tracks this same animation (see updateWindowSize), so tab + card read as one
-        // piece morphing open from the top.
-        .animation(.spring(response: 0.40, dampingFraction: 0.70), value: state.expanded)
+        // A smooth, near-critically-damped glide: the card eases open from the top and
+        // comes to rest without the bouncy overshoot that read as the island "falling
+        // into place." Quick response, no visible settle.
+        .animation(.spring(response: 0.32, dampingFraction: 0.96), value: state.expanded)
         .onHover { hovering in
             // Always keep `hovered` in sync — otherwise it sticks `true` after the
             // card closes and the lip never retracts until a second hover cycle.

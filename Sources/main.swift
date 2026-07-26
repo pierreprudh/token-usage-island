@@ -239,13 +239,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.layoutFromHosting()
         }
 
-        // Refresh on each expand (throttled — a rapid re-open won't refetch); relayout always.
+        // Refresh on each expand (throttled — a rapid re-open won't refetch).
         state.$expanded
             .removeDuplicates()
             .sink { [weak self] expanded in
-                if expanded { self?.store.requestRefresh() }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
-                    self?.layoutFromHosting()
+                guard let self else { return }
+                if expanded {
+                    self.store.requestRefresh()
+                    // Size the window to hold the card RIGHT AWAY (next runloop, once
+                    // SwiftUI has it in layout), non-animated and centered on the notch.
+                    // The visible open is the card's own .cardUnfold transition — the
+                    // window just has to be the correct size/position from frame one. The
+                    // content overflows a too-small window (the panel doesn't clip), so a
+                    // late resize made the card spawn offset to the side and then jump
+                    // into place. Snapping immediately keeps it centered throughout.
+                    DispatchQueue.main.async {
+                        self.currentSize = self.hosting.fittingSize
+                        self.reposition(animated: false)
+                    }
+                } else {
+                    // Shrink only AFTER the card has folded away, so the window doesn't
+                    // cut off the closing transition.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.42) {
+                        self.currentSize = self.hosting.fittingSize
+                        self.reposition(animated: false)
+                    }
                 }
             }
             .store(in: &bag)
@@ -285,6 +303,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.layoutFromHosting()
             }
         }
+    }
+
+    // We're a notch overlay and never want app focus. A Finder/Spotlight double-click
+    // (or plain `open -a`) *activates* us on launch, and that activation is what makes
+    // WindowServer flash the Spaces bar — the desktop drops down and springs back — while
+    // it hunts for a normal window of the newly-frontmost app on the current Space (our
+    // panel is a high-level, all-spaces panel, which doesn't qualify). Immediately handing
+    // activation back preempts that hunt. The `usage` CLI already launches with `open -g`
+    // (no activation); this covers the double-click path Finder/Spotlight force on us.
+    func applicationDidBecomeActive(_ notification: Notification) {
+        NSApp.deactivate()
     }
 
     func doRefresh() {
