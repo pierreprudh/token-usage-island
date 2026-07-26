@@ -204,9 +204,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &bag)
 
-        // One fetch at launch so the collapsed pill has a value. No polling loop —
-        // values refresh only when the island is opened.
+        // One fetch at launch so the collapsed pill has a value, then a gentle
+        // background poll so milestone crossings (10/20/30 %) are caught live. The
+        // loop backs off on a 429 and reuses the last good reading, so polling can
+        // never blank the UI or snowball into a rate limit.
         doRefresh()
+        store.startPolling()
 
         // Reposition if displays change.
         NotificationCenter.default.addObserver(

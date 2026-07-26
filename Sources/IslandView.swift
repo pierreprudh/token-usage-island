@@ -1,4 +1,23 @@
 import SwiftUI
+import ServiceManagement
+
+// Launch-at-login, backed by the modern ServiceManagement API (macOS 13+). The
+// main app registers itself as a login item — no helper bundle needed. Returns
+// the resulting on/off state so the UI only flips when the OS actually agreed.
+enum LoginItem {
+    static var enabled: Bool { SMAppService.mainApp.status == .enabled }
+
+    @discardableResult
+    static func setEnabled(_ want: Bool) -> Bool {
+        do {
+            if want { try SMAppService.mainApp.register() }
+            else    { try SMAppService.mainApp.unregister() }
+        } catch {
+            NSSound.beep()   // e.g. the app isn't in /Applications yet
+        }
+        return enabled
+    }
+}
 
 // Notch metrics are read live per-display (see updateNotchGeometry); these are
 // only the size constants the layout adds on top of the measured notch.
@@ -26,6 +45,9 @@ final class IslandState: ObservableObject {
     @Published var forceReveal = false
     // One-shot launch greeting: the tab reveals, plays a loading bar, then settles.
     @Published var launching = false
+    // One-shot milestone pulse: the tab reveals and glows when a new 10% band is hit.
+    @Published var celebrating = false
+    @Published var celebrateColor: Color = .white
 }
 
 struct IslandView: View {
@@ -37,11 +59,17 @@ struct IslandView: View {
     @State private var hovered = false
     @State private var launchBar: CGFloat = 0   // 0→1 fill for the launch loading bar
     @State private var didGreet = false
+    @State private var milestoneDisplay = 0     // the number rendered — rolls old→new
+    @State private var milestoneShow = false    // reveal state for the numeral
+    @State private var pulseOn = false          // warning-tier halo throb
+    @State private var pulseStrength: CGFloat = 0   // 0 none · 0.5 amber · 1 red
+    @State private var milestoneLogo = "claude" // which provider's mark to showcase
+    @State private var loginEnabled = false     // reflects SMAppService login-item state
 
     // At rest the tab is exactly the measured notch so it disappears into it.
     private var restTabWidth: CGFloat { state.hasNotch ? state.notchWidth : IslandSize.collapsedW }
     // Reveal the summary lip when hovered or open; at rest it's just the notch.
-    private var revealed: Bool { hovered || state.expanded || state.forceReveal || state.launching }
+    private var revealed: Bool { hovered || state.expanded || state.forceReveal || state.launching || state.celebrating }
     // When revealed, grow to at least minRevealW so content fits on narrow notches;
     // on wide notches this is a no-op (max keeps the measured width).
     private var tabWidth: CGFloat { revealed ? max(restTabWidth, IslandSize.minRevealW) : restTabWidth }
@@ -60,16 +88,15 @@ struct IslandView: View {
         }
         .animation(.spring(response: 0.34, dampingFraction: 0.82), value: state.expanded)
         .onHover { hovering in
-            if state.expanded {
-                if !hovering && !state.pinned {
-                    withAnimation(.spring(response: 0.32, dampingFraction: 0.7)) {
-                        state.expanded = false
-                    }
-                }
-            } else {
-                // The main hover animation: the lip springs out with a little overgrow.
-                withAnimation(.spring(response: 0.30, dampingFraction: 0.52)) {
-                    hovered = hovering
+            // Always keep `hovered` in sync — otherwise it sticks `true` after the
+            // card closes and the lip never retracts until a second hover cycle.
+            withAnimation(.spring(response: 0.30, dampingFraction: 0.52)) {
+                hovered = hovering
+            }
+            // Leaving an open (unpinned) card collapses it back to the lip.
+            if state.expanded && !hovering && !state.pinned {
+                withAnimation(.spring(response: 0.32, dampingFraction: 0.7)) {
+                    state.expanded = false
                 }
             }
         }
@@ -86,6 +113,9 @@ struct IslandView: View {
                     // Launch greeting: all three provider marks + the loading bar.
                     trioLogos(13)
                     launchLoadingBar
+                } else if state.celebrating && !state.expanded {
+                    // Milestone: showcase the crossed number (yields to an open card).
+                    milestoneLip
                 } else {
                     // Hover: Claude only.
                     logo("claude", 11, onLight: false)
@@ -102,10 +132,19 @@ struct IslandView: View {
         }
         .frame(width: tabWidth, height: tabHeight)
         .clipShape(bottomRounded(IslandSize.tabCorner))
+        // Warning-tier throb: a subtle size pulse only — no halo/glow. Gentle at
+        // amber, a touch stronger at red. Only the numeral carries colour.
+        .scaleEffect(pulseOn ? 1 + 0.035 * pulseStrength : 1, anchor: .top)
+        // Morph: a brief squash-and-stretch gives the tab a soft, gel-like give as
+        // it opens — layered on top of the hover scale.
+        .scaleEffect(x: milestoneShow ? 1.0 : (state.celebrating ? 0.97 : 1.0),
+                     y: milestoneShow ? 1.0 : (state.celebrating ? 1.05 : 1.0),
+                     anchor: .top)
         .scaleEffect(hovered && !state.expanded ? 1.03 : 1.0, anchor: .top)
         .contentShape(Rectangle())
         .onTapGesture { state.expanded.toggle() }
         .onAppear(perform: playLaunchGreeting)
+        .onReceive(store.$milestone.compactMap { $0 }) { playMilestone($0) }
     }
 
     // The three provider marks overlapping like linked rings. Each sits in a black
@@ -167,6 +206,68 @@ struct IslandView: View {
         }
     }
 
+    // The crossed number, front and centre. A tinted rounded numeral next to the
+    // Claude mark; the numeral springs up from small (see playMilestone).
+    private var milestoneLip: some View {
+        HStack(spacing: 7) {
+            logo(milestoneLogo, 11, onLight: false)
+            Text("\(milestoneDisplay)%")
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(state.celebrateColor)
+                // The digits roll from the old band to the new one — Apple's native
+                // numeric morph — while the whole numeral eases in.
+                .contentTransition(.numericText(value: Double(milestoneDisplay)))
+                .scaleEffect(milestoneShow ? 1 : 0.7, anchor: .leading)
+                .opacity(milestoneShow ? 1 : 0)
+        }
+    }
+
+    // Milestone tint: stays neutral white as usage climbs, and only turns warning
+    // colours near the ceiling — no red until you're actually close to the limit.
+    private func milestoneTint(_ pct: Double) -> Color {
+        if pct >= 90 { return Color(red: 0.94, green: 0.33, blue: 0.31) }   // red
+        if pct >= 80 { return Color(red: 0.96, green: 0.68, blue: 0.20) }   // amber
+        return .white
+    }
+
+    // One-shot, Apple-motion style: the tab eases open, the number springs up into
+    // place and holds, then everything settles back into the notch. No throb, no
+    // repeat. Won't override an open card — the fresh number is already visible.
+    private func playMilestone(_ event: MilestoneEvent) {
+        guard !state.expanded, !state.forceReveal else { return }
+        state.celebrateColor = milestoneTint(event.percent)
+        milestoneLogo = event.logoKey
+        milestoneDisplay = event.from                                // start on the old band
+        // Warning tiers get a throb: subtle at amber, stronger + doubled at red.
+        pulseStrength = event.percent >= 90 ? 1.0 : (event.percent >= 80 ? 0.5 : 0)
+        let pulseLegs = event.percent >= 90 ? 4 : 2                  // legs = 2 per full bloom
+        Task { @MainActor in
+            milestoneShow = false
+            pulseOn = false
+            // Rubbery open: a bouncy spring lets the width overshoot and settle.
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.58)) { state.celebrating = true }
+            try? await Task.sleep(nanoseconds: 150_000_000)          // lip morphs open
+            withAnimation(.spring(response: 0.46, dampingFraction: 0.66)) { milestoneShow = true }
+            try? await Task.sleep(nanoseconds: 380_000_000)          // read the old number…
+            // …then roll it up to the new band — the smooth numeric morph.
+            withAnimation(.smooth(duration: 0.6)) { milestoneDisplay = event.bucket }
+            if pulseStrength > 0 {
+                try? await Task.sleep(nanoseconds: 260_000_000)      // let the roll land
+                withAnimation(.easeInOut(duration: 0.5).repeatCount(pulseLegs, autoreverses: true)) {
+                    pulseOn = true
+                }
+                try? await Task.sleep(nanoseconds: UInt64(Double(pulseLegs) * 0.5 * 1_000_000_000))
+                pulseOn = false
+                try? await Task.sleep(nanoseconds: 450_000_000)
+            } else {
+                try? await Task.sleep(nanoseconds: 1_500_000_000)    // hold on the new number
+            }
+            withAnimation(.easeIn(duration: 0.22)) { milestoneShow = false }
+            withAnimation(.spring(response: 0.44, dampingFraction: 0.8)) { state.celebrating = false }
+        }
+    }
+
     // MARK: Light Control-Center card
 
     private var lightCard: some View {
@@ -210,6 +311,10 @@ struct IslandView: View {
                         .foregroundStyle(.tertiary)
                 }
                 Spacer()
+                loginToggle
+                Text("·")
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(.tertiary)
                 Button(action: onQuit) {
                     Text("Quit")
                         .font(.system(size: 9.5, weight: .medium))
@@ -220,6 +325,7 @@ struct IslandView: View {
             .padding(.horizontal, 15)
             .padding(.top, 9)
             .padding(.bottom, 12)
+            .onAppear { loginEnabled = LoginItem.enabled }
         }
         .frame(width: IslandSize.expandedW)
         .background(.thickMaterial, in: RoundedRectangle(cornerRadius: IslandSize.cornerExpanded, style: .continuous))
@@ -229,6 +335,26 @@ struct IslandView: View {
         .clipShape(RoundedRectangle(cornerRadius: IslandSize.cornerExpanded, style: .continuous))
         .environment(\.colorScheme, .light)   // force the light Control-Center look
         .shadow(color: .black.opacity(0.28), radius: 16, y: 8)
+    }
+
+    // Footer control: one click registers/unregisters the login item. Only flips the
+    // label once the OS confirms the new state (setEnabled returns the actual status).
+    private var loginToggle: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                loginEnabled = LoginItem.setEnabled(!loginEnabled)
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: loginEnabled ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 9, weight: .semibold))
+                Text("Open at login")
+                    .font(.system(size: 9.5, weight: .medium))
+            }
+            .foregroundStyle(loginEnabled ? CLAUDE_ACCENT : Color.secondary)
+        }
+        .buttonStyle(.plain)
+        .help(loginEnabled ? "Won't open automatically" : "Open automatically when you log in")
     }
 
     // A compact stat for the hover lip: percentage first, faint time label after ("12% 5h").

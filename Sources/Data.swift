@@ -51,15 +51,40 @@ func barColor(_ pct: Double?, accent: Color) -> Color {
 
 // MARK: - Store
 
+// A crossed 10% band (10, 20, 30 …). Carries a fresh id so the same band can
+// re-fire after a window reset drops usage back down and it climbs again.
+struct MilestoneEvent: Equatable {
+    let id = UUID()
+    let tool: String       // which provider crossed ("Claude", "Codex" …)
+    let logoKey: String    // its mark for the lip
+    let from: Int          // the band we were in (10, 20 …) — the roll starts here
+    let bucket: Int        // the band just crossed into
+    let percent: Double    // the reading that crossed it
+}
+
 @MainActor
 final class UsageStore: ObservableObject {
     @Published var tools: [Tool] = []
     @Published var lastUpdated: Date?
     @Published var loading = false
+    // Set whenever the headline percent crosses a new 10% band upward. The view
+    // observes this to play the milestone pulse.
+    @Published var milestone: MilestoneEvent?
 
     // Keep the last successful reading per tool so a transient failure
     // (e.g. a 429) doesn't blank out the numbers.
     private var lastGood: [String: Tool] = [:]
+
+    // Milestone tracking — the last 10% band we saw per tool.
+    private var lastBucket: [String: Int] = [:]
+
+    // Background polling. A gentle cadence keeps milestones timely without
+    // hammering the usage endpoint; on a 429 we back off exponentially and reset
+    // once a poll succeeds, so a rate limit can never snowball.
+    private var pollTask: Task<Void, Never>?
+    private let baseInterval: UInt64 = 90        // seconds between polls
+    private let maxInterval: UInt64 = 900        // 15 min ceiling under backoff
+    private var interval: UInt64 = 90
 
     // A specific Claude metric percent (e.g. "Session", "Weekly").
     func claudePercent(_ needle: String) -> Double? {
@@ -94,6 +119,51 @@ final class UsageStore: ObservableObject {
         }
         self.lastUpdated = Date()
         self.loading = false
+
+        // Rate-limit backoff: if any provider pushed back with a 429, double the
+        // poll interval (capped); otherwise settle back to the base cadence.
+        let rateLimited = fresh.contains { $0.failed?.contains("Rate limited") ?? false }
+        interval = rateLimited ? min(interval * 2, maxInterval) : baseInterval
+
+        detectMilestone()
+    }
+
+    // Fire a milestone when any tool's usage enters a higher 10% band. Each tool is
+    // tracked independently off its highest metric; on a window reset the value
+    // drops and we just re-arm the band without firing. If several cross in one
+    // refresh, the highest band wins the spotlight.
+    private func detectMilestone() {
+        var winner: MilestoneEvent?
+        for tool in tools {
+            guard let pct = tool.metrics.compactMap({ $0.percent }).max() else { continue }
+            let bucket = Int(pct / 10) * 10
+            let prev = lastBucket[tool.name]
+            lastBucket[tool.name] = bucket
+            guard let prev, bucket > prev, bucket > 0 else { continue }
+            let ev = MilestoneEvent(tool: tool.name, logoKey: tool.logoKey,
+                                    from: prev, bucket: bucket, percent: pct)
+            if winner == nil || ev.bucket > winner!.bucket { winner = ev }
+        }
+        if let winner { milestone = winner }
+    }
+
+    // Start the background poll loop. Idempotent — cancels any prior loop first.
+    func startPolling() {
+        pollTask?.cancel()
+        pollTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let wait = self.interval
+                try? await Task.sleep(nanoseconds: wait * 1_000_000_000)
+                if Task.isCancelled { break }
+                await self.refresh()
+            }
+        }
+    }
+
+    func stopPolling() {
+        pollTask?.cancel()
+        pollTask = nil
     }
 }
 
