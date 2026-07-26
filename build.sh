@@ -19,7 +19,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 swiftc -O \
   -o "$APP/Contents/MacOS/$BIN_NAME" \
-  Sources/Data.swift Sources/History.swift Sources/IslandView.swift Sources/main.swift \
+  Sources/Data.swift Sources/IslandView.swift Sources/main.swift \
   -framework AppKit -framework SwiftUI -framework Combine -framework CoreServices \
   -target arm64-apple-macos14.0
 

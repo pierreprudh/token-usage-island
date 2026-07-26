@@ -65,7 +65,6 @@ struct IslandView: View {
     @State private var pulseStrength: CGFloat = 0   // 0 none · 0.5 amber · 1 red
     @State private var milestoneLogo = "claude" // which provider's mark to showcase
     @State private var loginEnabled = false     // reflects SMAppService login-item state
-    @StateObject private var history = History() // 24h trend, recorded from store.tools
 
     // At rest the tab is exactly the measured notch so it disappears into it.
     private var restTabWidth: CGFloat { state.hasNotch ? state.notchWidth : IslandSize.collapsedW }
@@ -81,7 +80,7 @@ struct IslandView: View {
         VStack(spacing: IslandSize.gap) {
             notchTab
             if state.expanded {
-                lightCard
+                menuCard
                     .transition(.asymmetric(
                         insertion: .scale(scale: 0.94, anchor: .top).combined(with: .opacity),
                         removal: .opacity))
@@ -101,10 +100,22 @@ struct IslandView: View {
                 }
             }
         }
+        // Reliable exit backstop: the child row hover areas can make the plain
+        // `.onHover` above miss its exit, leaving the lip stuck open. This fires a
+        // definitive `.ended` when the pointer truly leaves, so we always retract.
+        .onContinuousHover { phase in
+            if case .ended = phase {
+                withAnimation(.spring(response: 0.30, dampingFraction: 0.52)) {
+                    hovered = false
+                }
+                if state.expanded && !state.pinned {
+                    withAnimation(.spring(response: 0.32, dampingFraction: 0.7)) {
+                        state.expanded = false
+                    }
+                }
+            }
+        }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        // Log each fresh reading into the 24h trend. Decoupled from the fetchers —
-        // we just observe the published tools, so polling code stays untouched.
-        .onReceive(store.$tools) { history.record($0, at: Date()) }
     }
 
     // MARK: Notch tab — invisible at rest (blends with the notch), reveals on hover
@@ -272,9 +283,9 @@ struct IslandView: View {
         }
     }
 
-    // MARK: Light Control-Center card
+    // MARK: Control-Center card — follows the system light/dark appearance
 
-    private var lightCard: some View {
+    private var menuCard: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 Text("Usage")
@@ -305,7 +316,7 @@ struct IslandView: View {
                 if idx > 0 {
                     Divider().padding(.horizontal, 15)
                 }
-                ToolRow(tool: tool, history: history)
+                ToolRow(tool: tool)
             }
 
             HStack(spacing: 6) {
@@ -337,7 +348,8 @@ struct IslandView: View {
             RoundedRectangle(cornerRadius: IslandSize.cornerExpanded, style: .continuous)
                 .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5))
         .clipShape(RoundedRectangle(cornerRadius: IslandSize.cornerExpanded, style: .continuous))
-        .environment(\.colorScheme, .light)   // force the light Control-Center look
+        // No forced colorScheme — the card inherits the system appearance so it
+        // matches whatever light/dark theme the Mac is currently using.
         .shadow(color: .black.opacity(0.28), radius: 16, y: 8)
     }
 
@@ -426,52 +438,51 @@ func logo(_ key: String, _ size: CGFloat, onLight: Bool) -> some View {
 
 struct ToolRow: View {
     let tool: Tool
-    @ObservedObject var history: History
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var hovered = false
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            RoundedRectangle(cornerRadius: 2)
-                .fill(tool.accent)
-                .frame(width: 3)
-                .frame(maxHeight: .infinity)
-
-            VStack(alignment: .leading, spacing: 7) {
-                HStack(spacing: 6) {
-                    logo(tool.logoKey, 14, onLight: true)
-                    Text(tool.name)
-                        .font(.system(size: 12.5, weight: .semibold))
-                        .foregroundStyle(.primary)
-                    if let sub = tool.subtitle {
-                        Text(sub)
-                            .font(.system(size: 9.5, weight: .medium))
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer(minLength: 0)
-                }
-
-                if let err = tool.failed {
-                    Text(err)
-                        .font(.system(size: 10.5))
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 7) {
+                // Bare provider mark — colour identity lives in the meter below.
+                logo(tool.logoKey, 15, onLight: colorScheme == .light)
+                Text(tool.name)
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .foregroundStyle(.primary)
+                if let sub = tool.subtitle {
+                    Text(sub)
+                        .font(.system(size: 9.5, weight: .medium))
                         .foregroundStyle(.secondary)
-                } else {
-                    ForEach(tool.metrics) { m in
-                        MetricRow(metric: m, accent: tool.accent,
-                                  trend: history.values(tool: tool.name, label: m.label))
-                    }
+                }
+                Spacer(minLength: 0)
+            }
+
+            if let err = tool.failed {
+                Text(err)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(tool.metrics) { m in
+                    MetricRow(metric: m, accent: tool.accent)
                 }
             }
-            .padding(.vertical, 10)
-            Spacer(minLength: 0)
         }
-        .fixedSize(horizontal: false, vertical: true)
+        .padding(.vertical, 10)
         .padding(.horizontal, 14)
+        .fixedSize(horizontal: false, vertical: true)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        // On-hover: the row grows a touch — a smooth size cue, no colour fill.
+        .scaleEffect(hovered ? 1.04 : 1.0)
+        .contentShape(Rectangle())
+        .onHover { h in
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.7)) { hovered = h }
+        }
     }
 }
 
 struct MetricRow: View {
     let metric: Metric
     let accent: Color
-    var trend: [Double] = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3.5) {
@@ -500,12 +511,6 @@ struct MetricRow: View {
                         }
                 }
                 .frame(height: 4.5)
-            }
-            // 24h trend — only once there are at least two readings to connect.
-            if trend.count >= 2 {
-                Sparkline(values: trend, accent: accent)
-                    .frame(height: 12)
-                    .padding(.top, 1)
             }
         }
     }
