@@ -78,13 +78,25 @@ final class UsageStore: ObservableObject {
     // Milestone tracking — the last 10% band we saw per tool.
     private var lastBucket: [String: Int] = [:]
 
-    // Background polling. A gentle cadence keeps milestones timely without
-    // hammering the usage endpoint; on a 429 we back off exponentially and reset
-    // once a poll succeeds, so a rate limit can never snowball.
-    private var pollTask: Task<Void, Never>?
-    private let baseInterval: UInt64 = 90        // seconds between polls
-    private let maxInterval: UInt64 = 900        // 15 min ceiling under backoff
-    private var interval: UInt64 = 90
+    // Politeness throttle. Claude's usage endpoint is shared per-account — the CLI
+    // polls it too — so automatic triggers (file activity, backstop) fetch at most
+    // once per `baseGap`, minimising overlap with the CLI's own requests.
+    private var backstopTask: Task<Void, Never>?
+    private var pendingRefresh = false
+    private var lastRefreshAt: Date?
+    private let baseGap: TimeInterval = 300      // ≥5 min between automatic fetches
+
+    // Hard safety gate. Measured: the endpoint trips on the ~3rd request inside a
+    // ~30 s sliding window that EVERY request re-extends (even 429s), and recovers
+    // only after ~20–30 s of total silence. So `refresh()` enforces a floor between
+    // any two requests, and a longer silence after a 429 — a single pending fire
+    // (`flushTask`) coalesces everything, and every path (manual, launch, retry)
+    // goes through this same gate so none can make the request that trips it.
+    private var flushTask: Task<Void, Never>?
+    private var nextAllowed = Date.distantPast
+    private let minSpacing: TimeInterval = 30
+    private var rlStrikes = 0
+    private let coolDowns: [TimeInterval] = [45, 120, 300, 900, 1800]
 
     // A specific Claude metric percent (e.g. "Session", "Weekly").
     func claudePercent(_ needle: String) -> Double? {
@@ -102,7 +114,18 @@ final class UsageStore: ObservableObject {
         return tools.flatMap { $0.metrics }.compactMap { $0.percent }.max()
     }
 
+    // The single choke point for hitting the network. Every path lands here, and
+    // the hard gate below guarantees we never make the request that trips the
+    // window: if we're inside the spacing floor or a 429 cooldown, we defer to one
+    // pending fire instead of sending.
     func refresh() async {
+        let now = Date()
+        if now < nextAllowed {
+            scheduleFlush(at: nextAllowed)
+            return
+        }
+        nextAllowed = now.addingTimeInterval(minSpacing)   // reserve this slot up front
+        lastRefreshAt = now
         loading = true
         async let claude = fetchClaude()
         async let codex = fetchCodex()
@@ -120,12 +143,52 @@ final class UsageStore: ObservableObject {
         self.lastUpdated = Date()
         self.loading = false
 
-        // Rate-limit backoff: if any provider pushed back with a 429, double the
-        // poll interval (capped); otherwise settle back to the base cadence.
+        // 429 recovery: go fully silent for a cooldown (measured recovery ≈ 20–30 s,
+        // escalating only if it persists) and queue exactly one retry at the end of
+        // that silence. On success, reset — a transient blip clears itself.
         let rateLimited = fresh.contains { $0.failed?.contains("Rate limited") ?? false }
-        interval = rateLimited ? min(interval * 2, maxInterval) : baseInterval
+        if rateLimited {
+            rlStrikes = min(rlStrikes + 1, coolDowns.count)
+            nextAllowed = Date().addingTimeInterval(coolDowns[rlStrikes - 1])
+            scheduleFlush(at: nextAllowed)
+        } else {
+            rlStrikes = 0
+        }
 
         detectMilestone()
+    }
+
+    // Coalesce every deferred request into a single fire at `when` — so no matter
+    // how many triggers pile up during the gate, only one request goes out.
+    private func scheduleFlush(at when: Date) {
+        guard flushTask == nil else { return }
+        let delay = max(0, when.timeIntervalSinceNow)
+        flushTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            self?.flushTask = nil
+            await self?.refresh()
+        }
+    }
+
+    // Politeness entry point for automatic triggers (file activity, backstop, card
+    // open): fetch at most once per baseGap. The hard gate in refresh() still
+    // applies underneath, so this only decides how often we *attempt*.
+    func requestRefresh() {
+        if let last = lastRefreshAt {
+            let elapsed = Date().timeIntervalSince(last)
+            if elapsed < baseGap {
+                guard !pendingRefresh else { return }   // already one queued
+                pendingRefresh = true
+                let delay = baseGap - elapsed
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    self?.pendingRefresh = false
+                    await self?.refresh()
+                }
+                return
+            }
+        }
+        Task { await refresh() }
     }
 
     // Fire a milestone when any tool's usage enters a higher 10% band. Each tool is
@@ -147,23 +210,23 @@ final class UsageStore: ObservableObject {
         if let winner { milestone = winner }
     }
 
-    // Start the background poll loop. Idempotent — cancels any prior loop first.
-    func startPolling() {
-        pollTask?.cancel()
-        pollTask = Task { @MainActor [weak self] in
+    // Slow idle backstop: a heartbeat that requests a refresh every 15 min so usage
+    // stays fresh even with no local file activity (e.g. changes from another Mac).
+    // It routes through the throttle, so it never fetches on top of a recent one.
+    func startBackstop() {
+        backstopTask?.cancel()
+        backstopTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
-                guard let self else { return }
-                let wait = self.interval
-                try? await Task.sleep(nanoseconds: wait * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: 900 * 1_000_000_000)   // 15 min
                 if Task.isCancelled { break }
-                await self.refresh()
+                self?.requestRefresh()
             }
         }
     }
 
-    func stopPolling() {
-        pollTask?.cancel()
-        pollTask = nil
+    func stopBackstop() {
+        backstopTask?.cancel()
+        backstopTask = nil
     }
 }
 
@@ -281,7 +344,7 @@ func fetchClaude() async -> Tool {
 
 // MARK: - Codex (last rate_limits from newest session log)
 
-let CODEX_ACCENT = Color(red: 0.20, green: 0.72, blue: 0.55)   // teal/green
+let CODEX_ACCENT = Color(red: 0.063, green: 0.639, blue: 0.498)   // OpenAI green #10A37F
 
 func fetchCodex() async -> Tool {
     var tool = Tool(name: "Codex", logoKey: "codex", accent: CODEX_ACCENT, metrics: [], subtitle: nil, failed: nil)

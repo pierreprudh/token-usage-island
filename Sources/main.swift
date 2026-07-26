@@ -1,6 +1,60 @@
 import AppKit
 import SwiftUI
 import Combine
+import CoreServices   // FSEvents — watch the local coding-tool files for activity
+
+// Watches a set of directories via FSEvents and calls `onChange` (coalesced by the
+// stream's own latency) whenever anything under them is written. This is our
+// "webhook" for the local tools: Codex session logs and the OpenCode DB change
+// only while you're actually coding, so a change is our cue that usage has moved.
+final class FileWatcher {
+    private var stream: FSEventStreamRef?
+    private let paths: [String]
+    private let onChange: () -> Void
+    private let queue = DispatchQueue(label: "island.fswatch")
+
+    init(paths: [String], onChange: @escaping () -> Void) {
+        self.paths = paths
+        self.onChange = onChange
+    }
+
+    func start() {
+        guard !paths.isEmpty, stream == nil else { return }
+        var ctx = FSEventStreamContext(version: 0,
+            info: Unmanaged.passUnretained(self).toOpaque(),
+            retain: nil, release: nil, copyDescription: nil)
+        let callback: FSEventStreamCallback = { _, info, _, _, _, _ in
+            guard let info else { return }
+            Unmanaged<FileWatcher>.fromOpaque(info).takeUnretainedValue().onChange()
+        }
+        let flags = UInt32(kFSEventStreamCreateFlagNoDefer
+                         | kFSEventStreamCreateFlagFileEvents
+                         | kFSEventStreamCreateFlagIgnoreSelf)
+        guard let stream = FSEventStreamCreate(kCFAllocatorDefault, callback, &ctx,
+            paths as CFArray, FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+            2.0,                       // coalesce bursts of writes over ~2s
+            flags) else { return }
+        FSEventStreamSetDispatchQueue(stream, queue)
+        FSEventStreamStart(stream)
+        self.stream = stream
+    }
+
+    func stop() {
+        guard let stream else { return }
+        FSEventStreamStop(stream)
+        FSEventStreamInvalidate(stream)
+        FSEventStreamRelease(stream)
+        self.stream = nil
+    }
+
+    // The existing coding-tool data dirs, so we never hand FSEvents a missing path.
+    static func codingToolPaths() -> [String] {
+        let fm = FileManager.default
+        return ["~/.codex/sessions", "~/.local/share/opencode"]
+            .map { ($0 as NSString).expandingTildeInPath }
+            .filter { fm.fileExists(atPath: $0) }
+    }
+}
 
 // Measure content size and report upward.
 struct SizeKey: PreferenceKey {
@@ -132,6 +186,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = MacModel.detect()
     var window: NSPanel!
     var hosting: NSHostingView<RootView>!
+    var watcher: FileWatcher?
     var bag = Set<AnyCancellable>()
     var currentSize: CGSize = .zero
     // The panel is created off-screen and only shown once positioned at the notch,
@@ -184,11 +239,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.layoutFromHosting()
         }
 
-        // Fetch fresh values on each expand (the deliberate click); relayout always.
+        // Refresh on each expand (throttled — a rapid re-open won't refetch); relayout always.
         state.$expanded
             .removeDuplicates()
             .sink { [weak self] expanded in
-                if expanded { self?.doRefresh() }
+                if expanded { self?.store.requestRefresh() }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
                     self?.layoutFromHosting()
                 }
@@ -204,12 +259,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &bag)
 
-        // One fetch at launch so the collapsed pill has a value, then a gentle
-        // background poll so milestone crossings (10/20/30 %) are caught live. The
-        // loop backs off on a 429 and reuses the last good reading, so polling can
-        // never blank the UI or snowball into a rate limit.
+        // One fetch at launch so the collapsed pill has a value. After that, refreshes
+        // are event-driven: an FSEvents watch on the local coding-tool files triggers
+        // a (throttled) refresh whenever you're actively coding, plus a slow 15-min
+        // backstop for idle. Every trigger routes through the ≤1/5-min throttle, so we
+        // never hammer Claude's shared usage endpoint.
         doRefresh()
-        store.startPolling()
+        store.startBackstop()
+
+        watcher = FileWatcher(paths: FileWatcher.codingToolPaths()) { [weak self] in
+            // FSEvents fires on a background queue — hop to main for the store.
+            DispatchQueue.main.async { self?.store.requestRefresh() }
+        }
+        watcher?.start()
 
         // Reposition if displays change.
         NotificationCenter.default.addObserver(
