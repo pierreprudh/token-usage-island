@@ -64,7 +64,18 @@ your Keychain. Nothing is sent anywhere else, and there is no telemetry.
 
 ```bash
 brew install --cask --no-quarantine pierreprudh/tap/token-usage-island
-open "/Applications/Token Usage Island.app"
+usage island   # launch from anywhere
+```
+
+The cask puts a `usage` command on your `PATH`, so you can control the app from any terminal
+(with `<TAB>` completion in zsh):
+
+```bash
+usage island     # launch the app
+usage off        # turn it off       (aliases: quit, stop)
+usage restart    # relaunch it
+usage version    # print the installed version
+usage help       # show all commands
 ```
 
 `--no-quarantine` is required because the app is ad-hoc signed (not notarized with an Apple
@@ -75,9 +86,8 @@ Developer ID); it tells Gatekeeper to trust the download.
 ```bash
 git clone https://github.com/pierreprudh/token-usage-island.git
 cd token-usage-island
-./build.sh
-cp -R "build/Token Usage Island.app" /Applications/
-open "/Applications/Token Usage Island.app"
+./build.sh install   # builds, installs to /Applications, and links the `usage` command
+usage island
 ```
 
 On first launch macOS asks to allow reading the *"Claude Code-credentials"* Keychain item —
