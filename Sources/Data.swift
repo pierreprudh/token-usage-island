@@ -344,7 +344,7 @@ func fetchClaude() async -> Tool {
 
 // MARK: - Codex (last rate_limits from newest session log)
 
-let CODEX_ACCENT = Color(red: 0.063, green: 0.639, blue: 0.498)   // OpenAI green #10A37F
+let CODEX_ACCENT = Color(red: 0.470, green: 0.522, blue: 0.922)   // Codex periwinkle-blue #7885EB
 
 func fetchCodex() async -> Tool {
     var tool = Tool(name: "Codex", logoKey: "codex", accent: CODEX_ACCENT, metrics: [], subtitle: nil, failed: nil)
