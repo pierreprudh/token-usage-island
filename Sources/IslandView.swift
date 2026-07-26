@@ -367,7 +367,9 @@ struct IslandView: View {
                 Text("Open at login")
                     .font(.system(size: 9.5, weight: .medium))
             }
-            .foregroundStyle(loginEnabled ? CLAUDE_ACCENT : Color.secondary)
+            // Neutral, theme-aware tint — matches the adjacent Quit control rather
+            // than borrowing a provider's brand colour.
+            .foregroundStyle(loginEnabled ? Color.primary : Color.secondary)
         }
         .buttonStyle(.plain)
         .help(loginEnabled ? "Won't open automatically" : "Open automatically when you log in")
