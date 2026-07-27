@@ -13,6 +13,12 @@ usage you've burned — without opening a single app.
 
 <br />
 
+<sub>Hover the notch for the at-a-glance lip — no click needed:</sub>
+
+![The hover lip — Claude's 5 h and weekly rates](docs/hover.png)
+
+<br />
+
 ![Platform](https://img.shields.io/badge/macOS-14%2B-black?logo=apple&logoColor=white)
 &nbsp;![Swift](https://img.shields.io/badge/Swift-6-orange?logo=swift&logoColor=white)
 &nbsp;![UI](https://img.shields.io/badge/UI-SwiftUI%20%2B%20AppKit-blue)
