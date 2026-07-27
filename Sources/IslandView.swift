@@ -307,9 +307,9 @@ struct IslandView: View {
                 }
                 try? await Task.sleep(nanoseconds: UInt64(Double(pulseLegs) * 0.5 * 1_000_000_000))
                 pulseOn = false
-                try? await Task.sleep(nanoseconds: 450_000_000)
+                try? await Task.sleep(nanoseconds: 1_100_000_000)    // linger on the warning
             } else {
-                try? await Task.sleep(nanoseconds: 1_500_000_000)    // hold on the new number
+                try? await Task.sleep(nanoseconds: 2_400_000_000)    // hold on the new number
             }
             withAnimation(.easeIn(duration: 0.22)) { milestoneShow = false }
             withAnimation(.spring(response: 0.44, dampingFraction: 0.8)) { state.celebrating = false }
