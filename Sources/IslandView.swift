@@ -65,6 +65,7 @@ struct IslandView: View {
     @State private var pulseStrength: CGFloat = 0   // 0 none · 0.5 amber · 1 red
     @State private var milestoneLogo = "claude" // which provider's mark to showcase
     @State private var milestonePeriod = ""     // which limit the crossed % is for — "5h" / "7d"
+    @State private var cardShown = false         // card opacity gate — animated apart from layout
     @State private var loginEnabled = false     // reflects SMAppService login-item state
     @State private var draggingTool: Tool?      // the row being drag-reordered, if any
     @State private var rowFrames: [UUID: CGRect] = [:]   // each row's slot, for drag hit-testing
@@ -80,17 +81,25 @@ struct IslandView: View {
     private var tabHeight: CGFloat { baseTabHeight + (revealed ? IslandSize.lipHeight : 0) }
 
     var body: some View {
-        VStack(spacing: IslandSize.gap) {
-            notchTab
-            if state.expanded {
+        // The tab is pinned to the top and drawn ON TOP; the card is a separate layer
+        // that sits a tab+gap below it and just fades in place. Decoupling them means the
+        // island never rides the card's layout animation — opening reads as the card
+        // appearing beneath a fixed notch, not the whole thing rising up from below.
+        ZStack(alignment: .top) {
+            if state.expanded || cardShown {
                 menuCard
-                    .transition(.cardUnfold)
+                    .padding(.top, tabHeight + IslandSize.gap)
+                    .opacity(cardShown ? 1 : 0)
             }
+            notchTab
         }
-        // A smooth, near-critically-damped glide: the card eases open from the top and
-        // comes to rest without the bouncy overshoot that read as the island "falling
-        // into place." Quick response, no visible settle.
-        .animation(.spring(response: 0.32, dampingFraction: 0.96), value: state.expanded)
+        // Decouple the card's appearance from the layout: the card enters/leaves the
+        // layout INSTANTLY (so the window snaps and the tab never rides an animated
+        // resize — that resize is what made the island dip and rise, "coming from the
+        // bottom"), and only its opacity is animated. The tab holds dead still.
+        .onChange(of: state.expanded) { _, open in
+            withAnimation(.easeOut(duration: open ? 0.26 : 0.17)) { cardShown = open }
+        }
         .onHover { hovering in
             // Always keep `hovered` in sync — otherwise it sticks `true` after the
             // card closes and the lip never retracts until a second hover cycle.
@@ -504,26 +513,6 @@ struct IslandView: View {
 
     private func timeString(_ d: Date) -> String {
         let f = DateFormatter(); f.dateFormat = "HH:mm"; return f.string(from: d)
-    }
-}
-
-// The menu card unfolds downward out of the tab: it grows from zero height pinned
-// at its top edge — so it appears to extrude from the notch — while a slight
-// horizontal give and a quick opacity fade keep it feeling soft rather than
-// mechanical. Paired with the window height tracking the content, the card is also
-// revealed top-down by the growing frame, so the two read as one morph from the top.
-private struct CardUnfold: ViewModifier {
-    let p: CGFloat   // 0 = folded into the tab · 1 = fully open
-    func body(content: Content) -> some View {
-        content
-            .scaleEffect(x: 0.92 + 0.08 * p, y: p, anchor: .top)
-            .opacity(Double(min(1, p * 1.8)))
-    }
-}
-
-extension AnyTransition {
-    static var cardUnfold: AnyTransition {
-        .modifier(active: CardUnfold(p: 0), identity: CardUnfold(p: 1))
     }
 }
 
