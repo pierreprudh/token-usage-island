@@ -88,13 +88,12 @@ struct IslandView: View {
         ZStack(alignment: .top) {
             if state.expanded || cardShown {
                 menuCard
-                    // A whisper of scale from the top edge (just below the tab) gives the
-                    // card a soft "materialize" as it fades — richer than a flat fade, and
-                    // since scaleEffect is geometric it never touches the layout, so the
-                    // tab still can't move.
-                    .scaleEffect(cardShown ? 1 : 0.965, anchor: .top)
                     .padding(.top, tabHeight + IslandSize.gap)
+                    // Materialize by focus, not motion: the card fades up from a soft blur
+                    // in place. No scale, no offset — nothing moves vertically, so it can't
+                    // read as "coming from" any direction. The tab stays dead still.
                     .opacity(cardShown ? 1 : 0)
+                    .blur(radius: cardShown ? 0 : 8)
             }
             notchTab
         }
