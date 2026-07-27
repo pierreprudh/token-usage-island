@@ -64,6 +64,7 @@ struct IslandView: View {
     @State private var pulseOn = false          // warning-tier halo throb
     @State private var pulseStrength: CGFloat = 0   // 0 none · 0.5 amber · 1 red
     @State private var milestoneLogo = "claude" // which provider's mark to showcase
+    @State private var milestonePeriod = ""     // which limit the crossed % is for — "5h" / "7d"
     @State private var loginEnabled = false     // reflects SMAppService login-item state
     @State private var draggingTool: Tool?      // the row being drag-reordered, if any
     @State private var rowFrames: [UUID: CGRect] = [:]   // each row's slot, for drag hit-testing
@@ -239,16 +240,34 @@ struct IslandView: View {
     private var milestoneLip: some View {
         HStack(spacing: 7) {
             logo(milestoneLogo, 11, onLight: false)
-            Text("\(milestoneDisplay)%")
-                .font(.system(size: 13, weight: .semibold, design: .rounded))
-                .monospacedDigit()
-                .foregroundStyle(state.celebrateColor)
-                // The digits roll from the old band to the new one — Apple's native
-                // numeric morph — while the whole numeral eases in.
-                .contentTransition(.numericText(value: Double(milestoneDisplay)))
-                .scaleEffect(milestoneShow ? 1 : 0.7, anchor: .leading)
-                .opacity(milestoneShow ? 1 : 0)
+            HStack(alignment: .firstTextBaseline, spacing: 3) {
+                Text("\(milestoneDisplay)%")
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(state.celebrateColor)
+                    // The digits roll from the old band to the new one — Apple's native
+                    // numeric morph — while the whole numeral eases in.
+                    .contentTransition(.numericText(value: Double(milestoneDisplay)))
+                // Which limit crossed — the 5 h session vs the 7 d weekly window — so a
+                // "40%" pulse is never ambiguous about which ceiling it's climbing toward.
+                if !milestonePeriod.isEmpty {
+                    Text(milestonePeriod)
+                        .font(.system(size: 8, weight: .medium))
+                        .foregroundStyle(state.celebrateColor.opacity(0.55))
+                }
+            }
+            .scaleEffect(milestoneShow ? 1 : 0.7, anchor: .leading)
+            .opacity(milestoneShow ? 1 : 0)
         }
+    }
+
+    // Short tag for which limit a milestone belongs to, matching the hover lip's
+    // vocabulary: the rolling 5-hour session vs the 7-day weekly window.
+    private func periodTag(_ label: String) -> String {
+        let l = label.lowercased()
+        if l.contains("5h") || l.contains("session") { return "5h" }
+        if l.contains("week") { return "7d" }
+        return ""
     }
 
     // Milestone tint: stays neutral white as usage climbs, and only turns warning
@@ -266,6 +285,7 @@ struct IslandView: View {
         guard !state.expanded, !state.forceReveal else { return }
         state.celebrateColor = milestoneTint(event.percent)
         milestoneLogo = event.logoKey
+        milestonePeriod = periodTag(event.metricLabel)
         milestoneDisplay = event.from                                // start on the old band
         // Warning tiers get a throb: subtle at amber, stronger + doubled at red.
         pulseStrength = event.percent >= 90 ? 1.0 : (event.percent >= 80 ? 0.5 : 0)

@@ -60,6 +60,7 @@ struct MilestoneEvent: Equatable {
     let from: Int          // the band we were in (10, 20 …) — the roll starts here
     let bucket: Int        // the band just crossed into
     let percent: Double    // the reading that crossed it
+    let metricLabel: String // which limit crossed — e.g. "Session · 5h" or "Weekly"
 }
 
 @MainActor
@@ -220,13 +221,18 @@ final class UsageStore: ObservableObject {
     private func detectMilestone() {
         var winner: MilestoneEvent?
         for tool in tools {
-            guard let pct = tool.metrics.compactMap({ $0.percent }).max() else { continue }
-            let bucket = Int(pct / 10) * 10
+            // The metric carrying the highest percent is the one that crossed — keep its
+            // label so the milestone lip can say which limit (5 h session vs weekly).
+            guard let top = tool.metrics
+                .compactMap({ m in m.percent.map { (label: m.label, pct: $0) } })
+                .max(by: { $0.pct < $1.pct }) else { continue }
+            let bucket = Int(top.pct / 10) * 10
             let prev = lastBucket[tool.name]
             lastBucket[tool.name] = bucket
             guard let prev, bucket > prev, bucket > 0 else { continue }
             let ev = MilestoneEvent(tool: tool.name, logoKey: tool.logoKey,
-                                    from: prev, bucket: bucket, percent: pct)
+                                    from: prev, bucket: bucket, percent: top.pct,
+                                    metricLabel: top.label)
             if winner == nil || ev.bucket > winner!.bucket { winner = ev }
         }
         if let winner { milestone = winner }
