@@ -88,6 +88,11 @@ struct IslandView: View {
         ZStack(alignment: .top) {
             if state.expanded || cardShown {
                 menuCard
+                    // A whisper of scale from the top edge (just below the tab) gives the
+                    // card a soft "materialize" as it fades — richer than a flat fade, and
+                    // since scaleEffect is geometric it never touches the layout, so the
+                    // tab still can't move.
+                    .scaleEffect(cardShown ? 1 : 0.965, anchor: .top)
                     .padding(.top, tabHeight + IslandSize.gap)
                     .opacity(cardShown ? 1 : 0)
             }
@@ -98,7 +103,7 @@ struct IslandView: View {
         // resize — that resize is what made the island dip and rise, "coming from the
         // bottom"), and only its opacity is animated. The tab holds dead still.
         .onChange(of: state.expanded) { _, open in
-            withAnimation(.easeOut(duration: open ? 0.26 : 0.17)) { cardShown = open }
+            withAnimation(.easeOut(duration: open ? 0.34 : 0.2)) { cardShown = open }
         }
         .onHover { hovering in
             // Always keep `hovered` in sync — otherwise it sticks `true` after the
