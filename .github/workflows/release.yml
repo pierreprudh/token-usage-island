@@ -72,10 +72,27 @@ jobs:
 
             **SHA-256:** `${{ steps.package.outputs.sha256 }}`
 
+      # Is the tap token configured? A step's own `env:` block is NOT visible to that
+      # step's `if:`, so guarding the bump on `env.TAP_TOKEN` always read empty and the
+      # step skipped even when the secret was set — v1.2.0 and v1.2.1 both shipped with
+      # a stale cask. Hand the answer to the next step as an output instead, which keeps
+      # the PAT out of every other step's environment.
+      - name: Check for tap token
+        id: tap
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          if [ -n "$TAP_TOKEN" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "⚠ TAP_TOKEN not set — bump \`Casks/token-usage-island.rb\` by hand with the values above." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       # Auto-bumps the cask in the tap repo. Optional: only runs if a TAP_TOKEN
       # secret (a PAT with `contents:write` on pierreprudh/homebrew-tap) is set.
       - name: Update Homebrew tap
-        if: ${{ env.TAP_TOKEN != '' }}
+        if: steps.tap.outputs.present == 'true'
         env:
           TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
           VERSION: ${{ steps.version.outputs.version }}
