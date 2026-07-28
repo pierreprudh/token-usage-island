@@ -82,8 +82,18 @@ final class UsageStore: ObservableObject {
     // (e.g. a 429) doesn't blank out the numbers.
     private var lastGood: [String: Tool] = [:]
 
-    // Milestone tracking — the last 10% band we saw per tool.
+    // Milestone tracking — the last 10% band we saw per *window*, keyed
+    // "Tool|Metric". One bucket per tool wasn't enough: a tool's metrics move
+    // independently (Claude's 5 h session sits far above its weekly), so tracking only
+    // the highest one meant a weekly 18→21 crossing was invisible, and a session reset
+    // flipping which metric is highest made the bucket lurch and eat real crossings.
     private var lastBucket: [String: Int] = [:]
+
+    // Crossings waiting for their moment on the lip. Detection can turn up several at
+    // once (two windows, two providers, or a refresh triggered by opening the card),
+    // and each one gets played in turn instead of the loudest silently winning.
+    private var milestoneQueue: [MilestoneEvent] = []
+    private let maxQueued = 6
 
     // Politeness throttle. Claude's usage endpoint is shared per-account — the CLI
     // polls it too — so automatic triggers (file activity, backstop) fetch at most
@@ -214,29 +224,62 @@ final class UsageStore: ObservableObject {
         Task { await refresh() }
     }
 
-    // Fire a milestone when any tool's usage enters a higher 10% band. Each tool is
-    // tracked independently off its highest metric; on a window reset the value
-    // drops and we just re-arm the band without firing. If several cross in one
-    // refresh, the highest band wins the spotlight.
+    // Fire a milestone when any usage window enters a higher 10% band. Every metric of
+    // every tool is tracked independently, so the 5 h session and the weekly window each
+    // get their own crossings; on a window reset the value drops and we just re-arm that
+    // band without firing. Several crossings in one refresh all get queued — the highest
+    // band leads, the rest follow, none are dropped.
     private func detectMilestone() {
-        var winner: MilestoneEvent?
+        var crossed: [MilestoneEvent] = []
         for tool in tools {
-            // The metric carrying the highest percent is the one that crossed — keep its
-            // label so the milestone lip can say which limit (5 h session vs weekly).
-            guard let top = tool.metrics
-                .compactMap({ m in m.percent.map { (label: m.label, pct: $0) } })
-                .max(by: { $0.pct < $1.pct }) else { continue }
-            let bucket = Int(top.pct / 10) * 10
-            let prev = lastBucket[tool.name]
-            lastBucket[tool.name] = bucket
-            guard let prev, bucket > prev, bucket > 0 else { continue }
-            let ev = MilestoneEvent(tool: tool.name, logoKey: tool.logoKey,
-                                    from: prev, bucket: bucket, percent: top.pct,
-                                    metricLabel: top.label)
-            if winner == nil || ev.bucket > winner!.bucket { winner = ev }
+            for m in tool.metrics {
+                guard let pct = m.percent else { continue }      // e.g. OpenCode's $ spend
+                let key = "\(tool.name)|\(m.label)"
+                let bucket = Int(pct / 10) * 10
+                let prev = lastBucket[key]
+                lastBucket[key] = bucket
+                guard let prev, bucket > prev, bucket > 0 else { continue }
+                crossed.append(MilestoneEvent(tool: tool.name, logoKey: tool.logoKey,
+                                              from: prev, bucket: bucket, percent: pct,
+                                              metricLabel: m.label))
+            }
         }
-        if let winner { milestone = winner }
+        guard !crossed.isEmpty else { return }
+        milestoneQueue += crossed.sorted { $0.bucket > $1.bucket }   // most urgent first
+        if milestoneQueue.count > maxQueued {                        // drop the stalest
+            milestoneQueue.removeFirst(milestoneQueue.count - maxQueued)
+        }
+        dequeueMilestone()
     }
+
+    // Hand the next crossing to the view, unless one is still playing. The hop off the
+    // current turn matters: @Published emits in `willSet`, so publishing from inside a
+    // subscriber's callback would be a re-entrant mutation.
+    private func dequeueMilestone() {
+        guard milestone == nil, !milestoneQueue.isEmpty else { return }
+        Task { @MainActor [weak self] in
+            guard let self, self.milestone == nil, !self.milestoneQueue.isEmpty else { return }
+            self.milestone = self.milestoneQueue.removeFirst()
+        }
+    }
+
+    // The view finished playing a crossing — clear the slot and offer the next.
+    func milestoneDidFinish() {
+        milestone = nil
+        dequeueMilestone()
+    }
+
+    // The view couldn't play this one (the card is open, so the number is already on
+    // screen). Park it at the head of the queue and stay quiet until `resumeMilestones()`
+    // — otherwise re-offering it immediately would spin.
+    func milestoneDeferred(_ event: MilestoneEvent) {
+        milestone = nil
+        milestoneQueue.insert(event, at: 0)
+        if milestoneQueue.count > maxQueued { milestoneQueue.removeLast() }
+    }
+
+    // The card closed: anything parked can have the lip now.
+    func resumeMilestones() { dequeueMilestone() }
 
     // Slow idle backstop: a heartbeat that requests a refresh every 15 min so usage
     // stays fresh even with no local file activity (e.g. changes from another Mac).
@@ -414,7 +457,11 @@ func fetchCodex() async -> Tool {
         if let resetEpoch = secondary["resets_at"] as? Double {
             detail = resetDetail(Date(timeIntervalSince1970: resetEpoch))
         }
-        tool.metrics.append(Metric(label: "Secondary", percent: used, detail: detail))
+        // Name it by its window like `primary` does — "Secondary" told the milestone lip
+        // nothing, so a Codex weekly crossing showed a bare "20%" with no period tag.
+        let window = secondary["window_minutes"] as? Double ?? 0
+        let label = window >= 10080 ? "Weekly" : (window >= 300 ? "Session" : "Secondary")
+        tool.metrics.append(Metric(label: label, percent: used, detail: detail))
     }
     if tool.metrics.isEmpty { tool.failed = "No rate-limit data yet." }
     return tool

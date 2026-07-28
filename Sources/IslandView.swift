@@ -103,6 +103,9 @@ struct IslandView: View {
         // bottom"), and only its opacity is animated. The tab holds dead still.
         .onChange(of: state.expanded) { _, open in
             withAnimation(.easeOut(duration: open ? 0.34 : 0.2)) { cardShown = open }
+            // Crossings detected while the card was open were parked, not lost — play
+            // them now that the lip is free.
+            if !open { store.resumeMilestones() }
         }
         .onHover { hovering in
             // Always keep `hovered` in sync — otherwise it sticks `true` after the
@@ -295,7 +298,14 @@ struct IslandView: View {
     // place and holds, then everything settles back into the notch. No throb, no
     // repeat. Won't override an open card — the fresh number is already visible.
     private func playMilestone(_ event: MilestoneEvent) {
-        guard !state.expanded, !state.forceReveal else { return }
+        // Card open (or QA reveal): the fresh number is already on screen, so don't fight
+        // it — hand the crossing back to be replayed once the card closes. Opening the
+        // card triggers a refresh, so this is the common case, and dropping it here is
+        // what made real crossings vanish without ever being shown.
+        guard !state.expanded, !state.forceReveal else {
+            Task { @MainActor in store.milestoneDeferred(event) }
+            return
+        }
         state.celebrateColor = milestoneTint(event.percent)
         milestoneLogo = event.logoKey
         milestonePeriod = periodTag(event.metricLabel)
@@ -326,6 +336,10 @@ struct IslandView: View {
             }
             withAnimation(.easeIn(duration: 0.22)) { milestoneShow = false }
             withAnimation(.spring(response: 0.44, dampingFraction: 0.8)) { state.celebrating = false }
+            // Settle fully into the notch before releasing the next queued crossing, so
+            // two bands in one refresh read as two beats rather than one blur.
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            store.milestoneDidFinish()
         }
     }
 
