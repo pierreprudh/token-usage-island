@@ -347,26 +347,24 @@ struct IslandView: View {
 
     private var menuCard: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
+            // spacing 0 + the trailing pull-in below keep the two header glyphs optically
+            // where they were: their 19pt hit targets add ~4pt of slack on every side, so
+            // the default spacing would double the gap and hold the pin off the edge.
+            HStack(spacing: 0) {
                 Text("Usage")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.primary)
                 Spacer()
-                Button(action: onRefresh) {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 10.5, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                        .rotationEffect(.degrees(store.loading ? 360 : 0))
-                        .animation(store.loading ? .linear(duration: 0.9).repeatForever(autoreverses: false) : .default,
-                                   value: store.loading)
-                }
-                .buttonStyle(.plain)
+                RefreshButton(store: store, action: onRefresh)
                 Button { state.pinned.toggle() } label: {
                     Image(systemName: state.pinned ? "pin.fill" : "pin")
                         .font(.system(size: 10.5, weight: .semibold))
                         .foregroundStyle(state.pinned ? CLAUDE_ACCENT : Color.secondary)
+                        .frame(width: 19, height: 19)
+                        .contentShape(Circle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(IconButtonStyle())
+                .padding(.trailing, -4)      // glyph keeps the row's 15pt inset
             }
             .padding(.horizontal, 15)
             .padding(.top, 13)
@@ -622,6 +620,79 @@ struct ToolRow: View {
         .contentShape(Rectangle())
         .onHover { h in
             withAnimation(.spring(response: 0.32, dampingFraction: 0.7)) { hovered = h }
+        }
+    }
+}
+
+// The card's header icons: the glyph dips under the pointer and springs back on
+// release, so a tap registers physically even when the action itself is a no-op.
+struct IconButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.84 : 1)
+            .animation(.snappy(duration: 0.22), value: configuration.isPressed)
+    }
+}
+
+// MARK: - Refresh control
+
+// Two honest states, each with the system's own motion:
+//
+//   every tap        — press dip + SF Symbols' native `.bounce`. Instant, and it doesn't
+//                      claim work happened, which matters because fetches are rate-gated:
+//                      `store.refresh()` usually returns before `loading` is ever set, so
+//                      most clicks send nothing. The old button, driven purely off
+//                      `loading`, therefore didn't move at all on those clicks.
+//   request in flight — the arrow turns: winds up, holds a beat for as long as the fetch
+//                      takes, then coasts to rest. Also covers fetches we didn't ask for
+//                      (file activity, the 15-min backstop, a deferred retry landing).
+//
+// The turning is hand-driven rather than `.symbolEffect(.rotate)` because that effect is
+// macOS 15+ (we ship 14+) and only animates layers a symbol marks "Can Rotate" —
+// arrow.clockwise has none, so it renders as a no-op. Accumulating whole 360° turns is
+// what Apple's own forum thread on that lands on, and because `spin` only ever counts up
+// in whole turns the glyph never rewinds and never rests askew.
+struct RefreshButton: View {
+    @ObservedObject var store: UsageStore
+    var action: () -> Void
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var spin: Double = 0
+    @State private var taps = 0                  // drives the native bounce
+    @State private var hovered = false
+    @State private var spinTask: Task<Void, Never>?
+
+    var body: some View {
+        Button { action(); taps += 1 } label: {
+            Image(systemName: "arrow.clockwise")
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundStyle(hovered ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+                .symbolEffect(.bounce, options: .speed(1.4), value: taps)
+                // Rotation sits inside the frame so only the glyph turns — the hover
+                // disc behind it holds still.
+                .rotationEffect(.degrees(spin))
+                .frame(width: 19, height: 19)
+                .background(Circle().fill(.primary.opacity(hovered ? 0.09 : 0)))
+                .contentShape(Circle())
+        }
+        .buttonStyle(IconButtonStyle())
+        .onHover { h in withAnimation(.easeOut(duration: 0.14)) { hovered = h } }
+        .onChange(of: store.loading) { _, busy in if busy { startTurning() } }
+    }
+
+    private func startTurning() {
+        // Reduce Motion: no sustained spinning. The bounce already carried the feedback.
+        guard !reduceMotion, spinTask == nil else { return }
+        spinTask = Task { @MainActor in
+            withAnimation(.easeIn(duration: 0.42)) { spin += 360 }        // wind up
+            try? await Task.sleep(for: .milliseconds(420))
+            while store.loading {                                          // hold the beat
+                withAnimation(.linear(duration: 0.55)) { spin += 360 }
+                try? await Task.sleep(for: .milliseconds(550))
+            }
+            withAnimation(.smooth(duration: 0.7)) { spin += 360 }          // coast to rest
+            try? await Task.sleep(for: .milliseconds(700))
+            spinTask = nil
         }
     }
 }
