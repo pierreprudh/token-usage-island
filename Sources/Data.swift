@@ -103,6 +103,13 @@ final class UsageStore: ObservableObject {
     private var lastRefreshAt: Date?
     private let baseGap: TimeInterval = 300      // ≥5 min between automatic fetches
 
+    // The local providers get their own, much shorter gap. Nothing about reading a
+    // jsonl and a SQLite file needs politeness — `localGap` exists only to keep a
+    // burst of Codex session writes from re-reading the same file dozens of times.
+    private var pendingLocal = false
+    private var lastLocalAt: Date?
+    private let localGap: TimeInterval = 3
+
     // Hard safety gate. Measured: the endpoint trips on the ~3rd request inside a
     // ~30 s sliding window that EVERY request re-extends (even 429s), and recovers
     // only after ~20–30 s of total silence. So `refresh()` enforces a floor between
@@ -164,15 +171,7 @@ final class UsageStore: ObservableObject {
         async let opencode = fetchOpenCode()
         let fresh = await [claude, codex, opencode]
 
-        self.tools = fresh.map { t in
-            if t.failed == nil && !t.metrics.isEmpty {
-                lastGood[t.name] = t
-                return t
-            }
-            // Fall back to the last good reading if we have one.
-            return lastGood[t.name] ?? t
-        }
-        applyOrder()
+        absorb(fresh)
         self.lastUpdated = Date()
         self.loading = false
 
@@ -188,6 +187,66 @@ final class UsageStore: ObservableObject {
             rlStrikes = 0
         }
 
+        detectMilestone()
+    }
+
+    // Fold fetched readings into `tools`: a good reading replaces its provider in
+    // place, a failed or empty one falls back to the last good reading we have. In
+    // place matters — it lets a local-only refresh update Codex and OpenCode without
+    // disturbing Claude's numbers.
+    private func absorb(_ incoming: [Tool]) {
+        for t in incoming {
+            let resolved: Tool
+            if t.failed == nil && !t.metrics.isEmpty {
+                lastGood[t.name] = t
+                resolved = t
+            } else {
+                resolved = lastGood[t.name] ?? t
+            }
+            if let i = tools.firstIndex(where: { $0.name == resolved.name }) {
+                tools[i] = resolved
+            } else {
+                tools.append(resolved)
+            }
+        }
+        applyOrder()
+    }
+
+    // Codex and OpenCode read local files — no network, no shared endpoint, nothing to
+    // be polite about. They used to queue behind Claude's 300 s gap, so a crossing that
+    // FSEvents saw instantly could sit unannounced for minutes: Codex hit 20% at
+    // 17:50:34 and the pulse wasn't due until 17:55:08. Now they have their own fast
+    // path and only Claude waits on the network gate.
+    //
+    // `lastUpdated` is deliberately left alone here: it labels the whole card, and
+    // Claude's number is the headline, so a local read shouldn't claim the card is
+    // fresher than the last actual fetch. `loading` likewise stays off — there's no
+    // request in flight to spin for.
+    func refreshLocalTools() {
+        if let last = lastLocalAt {
+            let elapsed = Date().timeIntervalSince(last)
+            if elapsed < localGap {
+                guard !pendingLocal else { return }      // already one queued
+                pendingLocal = true
+                let delay = localGap - elapsed
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    self?.pendingLocal = false
+                    await self?.readLocalTools()
+                }
+                return
+            }
+        }
+        Task { @MainActor [weak self] in await self?.readLocalTools() }
+    }
+
+    private func readLocalTools() async {
+        lastLocalAt = Date()
+        async let codex = fetchCodex()
+        async let opencode = fetchOpenCode()
+        absorb(await [codex, opencode])
+        // Claude's readings are untouched above, so its buckets simply re-confirm and
+        // only a real local crossing can fire here.
         detectMilestone()
     }
 

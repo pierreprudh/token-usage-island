@@ -287,7 +287,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         watcher = FileWatcher(paths: FileWatcher.codingToolPaths()) { [weak self] in
             // FSEvents fires on a background queue — hop to main for the store.
-            DispatchQueue.main.async { self?.store.requestRefresh() }
+            DispatchQueue.main.async {
+                // The write we just saw IS the local tools' new usage: read it now, so a
+                // Codex milestone lands while you're still looking at what caused it.
+                self?.store.refreshLocalTools()
+                // Coding activity usually means Claude moved too — ask, but politely.
+                self?.store.requestRefresh()
+            }
         }
         watcher?.start()
 
