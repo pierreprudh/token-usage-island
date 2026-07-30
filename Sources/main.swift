@@ -322,6 +322,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.deactivate()
     }
 
+    // macOS tears down FSEvents on process exit, but stopping the stream explicitly
+    // (a) closes the dispatch queue cleanly, and (b) prevents a stray callback firing
+    // during shutdown that could race the store's teardown. The 15-min backstop task
+    // is cancelled for the same reason.
+    func applicationWillTerminate(_ notification: Notification) {
+        watcher?.stop()
+        watcher = nil
+        store.stopBackstop()
+    }
+
     func doRefresh() {
         Task { await store.refresh() }
     }
