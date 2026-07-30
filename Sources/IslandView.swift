@@ -423,7 +423,20 @@ struct IslandView: View {
         .clipShape(RoundedRectangle(cornerRadius: IslandSize.cornerExpanded, style: .continuous))
         // No forced colorScheme — the card inherits the system appearance so it
         // matches whatever light/dark theme the Mac is currently using.
-        .shadow(color: .black.opacity(0.28), radius: 16, y: 8)
+        //
+        // `compositingGroup()` before `shadow` is load-bearing. `.thickMaterial` resolves
+        // to an NSVisualEffectView, and SwiftUI can't rasterise that view's alpha — so a
+        // bare `.shadow` gives up on the silhouette and shadows the layer's BOUNDING BOX.
+        // The card stayed correctly rounded while its shadow was a hard-cornered rectangle
+        // poking out past it: invisible over a dark backdrop, an obvious grey square over
+        // anything light. Grouping first hands the shadow a real rounded mask to trace.
+        .compositingGroup()
+        // Radius stays inside RootView's 20pt horizontal / 22pt bottom padding, because
+        // that padding is the only room the window gives the shadow — anything wider is
+        // sliced off flat at the window edge while still visibly dark, which reads as a
+        // faint square outline. An 11pt radius offset 4pt down decays to nothing within
+        // ~17pt on the sides and ~21pt below, so it lands inside the budget on every side.
+        .shadow(color: .black.opacity(0.30), radius: 11, y: 4)
     }
 
     // Live row reorder. While a row is dragged we swap it into whichever slot the
