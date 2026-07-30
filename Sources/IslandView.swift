@@ -365,6 +365,8 @@ struct IslandView: View {
                 }
                 .buttonStyle(IconButtonStyle())
                 .padding(.trailing, -4)      // glyph keeps the row's 15pt inset
+                .accessibilityLabel(state.pinned ? "Unpin card" : "Pin card")
+                .help(state.pinned ? "Unpin" : "Pin open")
             }
             .padding(.horizontal, 15)
             .padding(.top, 13)
@@ -678,6 +680,8 @@ struct RefreshButton: View {
         .buttonStyle(IconButtonStyle())
         .onHover { h in withAnimation(.easeOut(duration: 0.14)) { hovered = h } }
         .onChange(of: store.loading) { _, busy in if busy { startTurning() } }
+        .accessibilityLabel("Refresh usage")
+        .help("Refresh")
     }
 
     private func startTurning() {

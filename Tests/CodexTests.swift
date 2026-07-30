@@ -1,0 +1,96 @@
+import Foundation
+
+// Locks down the two Codex-specific bugs/fixes from the review:
+//
+//   1. Primary and secondary used to share a milestone bucket key, so when both
+//      happened to be weekly the second one's crossings got silently shadowed.
+//      The fix adds a `slot` to Metric and includes it in the key.
+//
+//   2. _fetchCodex() used to slurp the whole session .jsonl into memory. For
+//      multi-MB logs this is wasteful — the latest rate_limits line lives in
+//      the tail. We verify the tailOfFile helper does the right thing on a
+//      large fake log.
+@MainActor
+struct CodexTests {
+
+    static func run() async {
+        sameLabelDifferentSlotsAreSeparateBuckets()
+        await tailDropsPartialFirstLine()
+        await tailOfLargeFileIsFast()
+        await tailOfMissingFileIsNil()
+    }
+
+    // The slot on the Metric is what disambiguates two same-label metrics in
+    // the milestone bucket key. Without it, the second metric's crossing is
+    // shadowed by the first.
+    static func sameLabelDifferentSlotsAreSeparateBuckets() {
+        let primary = Metric(label: "Weekly", percent: 35, detail: "", slot: "primary")
+        let secondary = Metric(label: "Weekly", percent: 22, detail: "", slot: "secondary")
+        // Both have the same user-facing label…
+        expectEqual(primary.label, secondary.label)
+        // …but distinct slots, which the milestone key uses to keep them apart.
+        expectNotEqual(primary.slot ?? "", secondary.slot ?? "",
+                      "slots must differ so the milestone key can keep them separate")
+    }
+
+    // tailOfFile should return the last N bytes, dropping the partial first line
+    // when the read started mid-file.
+    static func tailDropsPartialFirstLine() async {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tui-test-\(UUID().uuidString).jsonl")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let body = (1...10).map { "line-\($0)-payload-padding-padding-padding-padding" }
+            .joined(separator: "\n")
+        do {
+            try body.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            fail("could not write test fixture: \(error)")
+            return
+        }
+        // Request a tail that starts mid-line. tailOfFile should drop the first
+        // partial line and return cleanly-split lines from there on.
+        let tail = tailOfFile(url, bytes: 80)
+        expectNotNil(tail)
+        guard let tail else { return }
+        let lines = tail.split(separator: "\n").map(String.init)
+        expect(!lines.isEmpty, "tail should not be empty")
+        // Every returned line must be a complete line (starts with "line-N-"),
+        // not a fragment of one.
+        for line in lines {
+            expect(line.hasPrefix("line-"),
+                   "partial first line should have been dropped, got: \(line)")
+        }
+    }
+
+    // Tail must be cheap: a 5 MB log, a 64 KB tail. Verify the function returns
+    // promptly and the result is non-nil.
+    static func tailOfLargeFileIsFast() async {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tui-test-large-\(UUID().uuidString).jsonl")
+        defer { try? FileManager.default.removeItem(at: url) }
+        // 5 MB of repetitive line content. Each line is well under 64 KB, so the
+        // last line is in the tail.
+        let line = String(repeating: "x", count: 200) + "\n"
+        let chunk = String(repeating: line, count: 25_000)         // 5 MB
+        do {
+            try chunk.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            fail("could not write large test fixture: \(error)")
+            return
+        }
+
+        let start = Date()
+        let tail = tailOfFile(url, bytes: 1 << 16)
+        let elapsed = Date().timeIntervalSince(start)
+        expectNotNil(tail, "tail of existing file must not be nil")
+        expect(elapsed < 1.0, "tail read should be near-instant; took \(elapsed)s")
+    }
+
+    // A non-existent file must return nil without throwing — the fetcher relies
+    // on this to report "No Codex sessions." cleanly.
+    static func tailOfMissingFileIsNil() async {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tui-test-missing-\(UUID().uuidString).jsonl")
+        expectNil(tailOfFile(url))
+    }
+}

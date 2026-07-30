@@ -9,6 +9,16 @@ struct Metric: Identifiable {
     let label: String        // "Session · 5h"
     let percent: Double?      // 0...100, nil if not a % metric
     let detail: String        // "Resets 17:30" or "$14.90 · 31M tok"
+    // Disambiguates metrics that share a label. Used in the milestone bucket key so
+    // Codex's primary and secondary (which can both be "Weekly") track independently
+    // instead of one silently shadowing the other.
+    let slot: String?
+    init(label: String, percent: Double?, detail: String, slot: String? = nil) {
+        self.label = label
+        self.percent = percent
+        self.detail = detail
+        self.slot = slot
+    }
 }
 
 struct Tool: Identifiable {
@@ -63,11 +73,28 @@ struct MilestoneEvent: Equatable {
     let metricLabel: String // which limit crossed — e.g. "Session · 5h" or "Weekly"
 }
 
+// MARK: - Fetcher protocol (test seam)
+//
+// Every path that hits the network goes through `UsageStore.refresh()`, which calls
+// `fetcher.fetchX()` for each provider. In production `LiveFetcher` reads the real
+// Keychain/SQLite/JSONL; tests inject a `MockFetcher` that returns canned Tool values
+// so the throttle/queue logic can be exercised without touching disk or network.
+protocol UsageFetcher {
+    func fetchClaude() async -> Tool
+    func fetchCodex() async -> Tool
+    func fetchOpenCode() async -> Tool
+}
+
 @MainActor
 final class UsageStore: ObservableObject {
     @Published var tools: [Tool] = []
     @Published var lastUpdated: Date?
     @Published var loading = false
+
+    // Injectable seams. `now` defaults to `Date()`; tests pin it for deterministic
+    // timing. `fetcher` defaults to `LiveFetcher`; tests pass a mock.
+    var now: () -> Date = { Date() }
+    var fetcher: UsageFetcher = LiveFetcher()
 
     // User-defined provider order (by tool name). The provider on top is the one
     // surfaced in the hover lip. Persisted so a drag-reorder survives relaunch.
@@ -83,10 +110,11 @@ final class UsageStore: ObservableObject {
     private var lastGood: [String: Tool] = [:]
 
     // Milestone tracking — the last 10% band we saw per *window*, keyed
-    // "Tool|Metric". One bucket per tool wasn't enough: a tool's metrics move
+    // "Tool|Metric|Slot". One bucket per tool wasn't enough: a tool's metrics move
     // independently (Claude's 5 h session sits far above its weekly), so tracking only
     // the highest one meant a weekly 18→21 crossing was invisible, and a session reset
     // flipping which metric is highest made the bucket lurch and eat real crossings.
+    // The slot term disambiguates Codex primary/secondary when both share a label.
     private var lastBucket: [String: Int] = [:]
 
     // Crossings waiting for their moment on the lip. Detection can turn up several at
@@ -100,15 +128,15 @@ final class UsageStore: ObservableObject {
     // once per `baseGap`, minimising overlap with the CLI's own requests.
     private var backstopTask: Task<Void, Never>?
     private var pendingRefresh = false
-    private var lastRefreshAt: Date?
-    private let baseGap: TimeInterval = 300      // ≥5 min between automatic fetches
+    var lastRefreshAt: Date?
+    var baseGap: TimeInterval = 300      // ≥5 min between automatic fetches
 
     // The local providers get their own, much shorter gap. Nothing about reading a
     // jsonl and a SQLite file needs politeness — `localGap` exists only to keep a
     // burst of Codex session writes from re-reading the same file dozens of times.
     private var pendingLocal = false
     private var lastLocalAt: Date?
-    private let localGap: TimeInterval = 3
+    var localGap: TimeInterval = 3
 
     // Hard safety gate. Measured: the endpoint trips on the ~3rd request inside a
     // ~30 s sliding window that EVERY request re-extends (even 429s), and recovers
@@ -117,10 +145,10 @@ final class UsageStore: ObservableObject {
     // (`flushTask`) coalesces everything, and every path (manual, launch, retry)
     // goes through this same gate so none can make the request that trips it.
     private var flushTask: Task<Void, Never>?
-    private var nextAllowed = Date.distantPast
-    private let minSpacing: TimeInterval = 30
-    private var rlStrikes = 0
-    private let coolDowns: [TimeInterval] = [45, 120, 300, 900, 1800]
+    var nextAllowed = Date.distantPast
+    var minSpacing: TimeInterval = 30
+    var rlStrikes = 0
+    var coolDowns: [TimeInterval] = [45, 120, 300, 900, 1800]
 
     // Sort `tools` into the user's saved order. Names not in the order list keep
     // their fetch position at the end, so a newly-added provider still appears.
@@ -158,7 +186,7 @@ final class UsageStore: ObservableObject {
     // window: if we're inside the spacing floor or a 429 cooldown, we defer to one
     // pending fire instead of sending.
     func refresh() async {
-        let now = Date()
+        let now = self.now()
         if now < nextAllowed {
             scheduleFlush(at: nextAllowed)
             return
@@ -166,13 +194,13 @@ final class UsageStore: ObservableObject {
         nextAllowed = now.addingTimeInterval(minSpacing)   // reserve this slot up front
         lastRefreshAt = now
         loading = true
-        async let claude = fetchClaude()
-        async let codex = fetchCodex()
-        async let opencode = fetchOpenCode()
+        async let claude = fetcher.fetchClaude()
+        async let codex = fetcher.fetchCodex()
+        async let opencode = fetcher.fetchOpenCode()
         let fresh = await [claude, codex, opencode]
 
         absorb(fresh)
-        self.lastUpdated = Date()
+        self.lastUpdated = self.now()
         self.loading = false
 
         // 429 recovery: go fully silent for a cooldown (measured recovery ≈ 20–30 s,
@@ -181,7 +209,7 @@ final class UsageStore: ObservableObject {
         let rateLimited = fresh.contains { $0.failed?.contains("Rate limited") ?? false }
         if rateLimited {
             rlStrikes = min(rlStrikes + 1, coolDowns.count)
-            nextAllowed = Date().addingTimeInterval(coolDowns[rlStrikes - 1])
+            nextAllowed = self.now().addingTimeInterval(coolDowns[rlStrikes - 1])
             scheduleFlush(at: nextAllowed)
         } else {
             rlStrikes = 0
@@ -224,7 +252,7 @@ final class UsageStore: ObservableObject {
     // request in flight to spin for.
     func refreshLocalTools() {
         if let last = lastLocalAt {
-            let elapsed = Date().timeIntervalSince(last)
+            let elapsed = now().timeIntervalSince(last)
             if elapsed < localGap {
                 guard !pendingLocal else { return }      // already one queued
                 pendingLocal = true
@@ -241,9 +269,9 @@ final class UsageStore: ObservableObject {
     }
 
     private func readLocalTools() async {
-        lastLocalAt = Date()
-        async let codex = fetchCodex()
-        async let opencode = fetchOpenCode()
+        lastLocalAt = now()
+        async let codex = fetcher.fetchCodex()
+        async let opencode = fetcher.fetchOpenCode()
         absorb(await [codex, opencode])
         // Claude's readings are untouched above, so its buckets simply re-confirm and
         // only a real local crossing can fire here.
@@ -254,7 +282,7 @@ final class UsageStore: ObservableObject {
     // how many triggers pile up during the gate, only one request goes out.
     private func scheduleFlush(at when: Date) {
         guard flushTask == nil else { return }
-        let delay = max(0, when.timeIntervalSinceNow)
+        let delay = max(0, when.timeIntervalSince(now()))
         flushTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             self?.flushTask = nil
@@ -267,7 +295,7 @@ final class UsageStore: ObservableObject {
     // applies underneath, so this only decides how often we *attempt*.
     func requestRefresh() {
         if let last = lastRefreshAt {
-            let elapsed = Date().timeIntervalSince(last)
+            let elapsed = now().timeIntervalSince(last)
             if elapsed < baseGap {
                 guard !pendingRefresh else { return }   // already one queued
                 pendingRefresh = true
@@ -288,12 +316,15 @@ final class UsageStore: ObservableObject {
     // get their own crossings; on a window reset the value drops and we just re-arm that
     // band without firing. Several crossings in one refresh all get queued — the highest
     // band leads, the rest follow, none are dropped.
-    private func detectMilestone() {
+    func detectMilestone() {
         var crossed: [MilestoneEvent] = []
         for tool in tools {
             for m in tool.metrics {
                 guard let pct = m.percent else { continue }      // e.g. OpenCode's $ spend
-                let key = "\(tool.name)|\(m.label)"
+                // Slot disambiguates metrics that share a label (Codex primary/secondary).
+                // Without it, two "Weekly" metrics collapsed into one bucket and one of
+                // the two crossings went unannounced.
+                let key = "\(tool.name)|\(m.label)|\(m.slot ?? "-")"
                 let bucket = Int(pct / 10) * 10
                 let prev = lastBucket[key]
                 lastBucket[key] = bucket
@@ -416,7 +447,7 @@ func resetDetail(_ date: Date?) -> String {
 
 let CLAUDE_ACCENT = Color(red: 0.85, green: 0.47, blue: 0.30)   // rust/orange
 
-func fetchClaude() async -> Tool {
+func _fetchClaude() async -> Tool {
     var tool = Tool(name: "Claude", logoKey: "claude", accent: CLAUDE_ACCENT, metrics: [], subtitle: nil, failed: nil)
 
     guard let raw = runProcess("/usr/bin/security",
@@ -476,11 +507,11 @@ func fetchClaude() async -> Tool {
 
 let CODEX_ACCENT = Color(red: 0.470, green: 0.522, blue: 0.922)   // Codex periwinkle-blue #7885EB
 
-func fetchCodex() async -> Tool {
+func _fetchCodex() async -> Tool {
     var tool = Tool(name: "Codex", logoKey: "codex", accent: CODEX_ACCENT, metrics: [], subtitle: nil, failed: nil)
 
     guard let fileURL = newestCodexSession(),
-          let content = try? String(contentsOf: fileURL, encoding: .utf8) else {
+          let content = tailOfFile(fileURL, bytes: 1 << 16) else {     // 64 KB tail
         tool.failed = "No Codex sessions."
         return tool
     }
@@ -508,7 +539,10 @@ func fetchCodex() async -> Tool {
         if let resetEpoch = primary["resets_at"] as? Double {
             detail = resetDetail(Date(timeIntervalSince1970: resetEpoch))
         }
-        tool.metrics.append(Metric(label: label, percent: used, detail: detail))
+        // `slot` disambiguates the primary/secondary pair in the milestone bucket key
+        // when both happen to share a label (e.g. two weekly windows). The user-facing
+        // label is unchanged.
+        tool.metrics.append(Metric(label: label, percent: used, detail: detail, slot: "primary"))
     }
     if let secondary = rl["secondary"] as? [String: Any],
        let used = secondary["used_percent"] as? Double {
@@ -520,7 +554,7 @@ func fetchCodex() async -> Tool {
         // nothing, so a Codex weekly crossing showed a bare "20%" with no period tag.
         let window = secondary["window_minutes"] as? Double ?? 0
         let label = window >= 10080 ? "Weekly" : (window >= 300 ? "Session" : "Secondary")
-        tool.metrics.append(Metric(label: label, percent: used, detail: detail))
+        tool.metrics.append(Metric(label: label, percent: used, detail: detail, slot: "secondary"))
     }
     if tool.metrics.isEmpty { tool.failed = "No rate-limit data yet." }
     return tool
@@ -542,6 +576,31 @@ func newestCodexSession() -> URL? {
     return newest?.0
 }
 
+// Read the tail of a file (default 64 KB) without slurping the whole thing. Codex
+// session logs can reach tens of MB; the latest `rate_limits` line is almost always
+// in the last few KB, so this gives us the same answer in a tiny fraction of the I/O
+// and decoding work. If we start mid-line, drop the first partial line.
+func tailOfFile(_ url: URL, bytes: Int = 1 << 16) -> String? {
+    let fm = FileManager.default
+    guard let attrs = try? fm.attributesOfItem(atPath: url.path),
+          let size = attrs[.size] as? Int, size > 0,
+          let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+    defer { try? handle.close() }
+    let toRead = min(size, bytes)
+    let offset = UInt64(size - toRead)
+    do {
+        try handle.seek(toOffset: offset)
+        let data = handle.readData(ofLength: toRead)
+        guard var str = String(data: data, encoding: .utf8) else { return nil }
+        if offset > 0, let nl = str.firstIndex(of: "\n") {
+            str = String(str[str.index(after: nl)...])
+        }
+        return str
+    } catch {
+        return nil
+    }
+}
+
 // recursively find a key in a nested JSON object
 func findKey(_ key: String, in obj: Any) -> Any? {
     if let dict = obj as? [String: Any] {
@@ -561,7 +620,7 @@ func findKey(_ key: String, in obj: Any) -> Any? {
 
 let OPENCODE_ACCENT = Color(red: 0.45, green: 0.55, blue: 0.95)   // indigo
 
-func fetchOpenCode() async -> Tool {
+func _fetchOpenCode() async -> Tool {
     var tool = Tool(name: "OpenCode", logoKey: "opencode", accent: OPENCODE_ACCENT,
                     metrics: [], subtitle: "pay-as-you-go", failed: nil)
 
@@ -595,4 +654,15 @@ func humanTokens(_ n: Double) -> String {
     if n >= 1_000_000 { return String(format: "%.1fM", n / 1_000_000) }
     if n >= 1_000 { return String(format: "%.0fK", n / 1_000) }
     return String(format: "%.0f", n)
+}
+
+// MARK: - Live fetcher
+
+// Production fetcher. Just delegates to the underscored functions above; the rename
+// avoids an `ambiguous use` between the free function and the protocol method when
+// both are visible to `LiveFetcher` (Swift's name resolution looks at both).
+struct LiveFetcher: UsageFetcher {
+    func fetchClaude() async -> Tool { await _fetchClaude() }
+    func fetchCodex() async -> Tool { await _fetchCodex() }
+    func fetchOpenCode() async -> Tool { await _fetchOpenCode() }
 }
