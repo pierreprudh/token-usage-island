@@ -16,6 +16,8 @@ struct CodexTests {
     static func run() async {
         sameLabelDifferentSlotsAreSeparateBuckets()
         await tailDropsPartialFirstLine()
+        await tailSurvivesMultibyteBoundary()
+        await tailFallsBackWhenNoNewlineInWindow()
         await tailOfLargeFileIsFast()
         await tailOfMissingFileIsNil()
     }
@@ -60,6 +62,66 @@ struct CodexTests {
             expect(line.hasPrefix("line-"),
                    "partial first line should have been dropped, got: \(line)")
         }
+    }
+
+    // Regression: the tail window can open in the middle of a multi-byte character,
+    // because session logs are prompt text and the byte offset knows nothing about
+    // character boundaries. Decoding the window before trimming the partial line
+    // returned nil for the whole file, so _fetchCodex() reported "No Codex sessions."
+    // on a log that had them. Every requested tail size must still yield the last
+    // line, whatever character the window happens to cut in half.
+    static func tailSurvivesMultibyteBoundary() async {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tui-test-utf8-\(UUID().uuidString).jsonl")
+        defer { try? FileManager.default.removeItem(at: url) }
+        // Emoji are 4 bytes, "é" is 2, "日" is 3 — a spread of widths so the sweep
+        // below lands inside sequences of several different lengths.
+        let padding = "🎉é日本語-padding-🚀-ünïcøde"
+        let body = (1...12).map { "line-\($0)-\(padding)" }.joined(separator: "\n")
+        do {
+            try body.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            fail("could not write utf8 test fixture: \(error)")
+            return
+        }
+        let lastLine = "line-12-\(padding)"
+        // Sweep every window size across a couple of lines. Some of these necessarily
+        // start mid-character; none may fail.
+        for size in 20...140 {
+            guard let tail = tailOfFile(url, bytes: size) else {
+                fail("tail returned nil for bytes: \(size) — multi-byte boundary regression")
+                continue
+            }
+            expect(tail.hasSuffix(lastLine),
+                   "tail(bytes: \(size)) must still end with the final line, got: \(tail.suffix(30))")
+            // A dropped partial line must never leave a replacement char behind, which
+            // is what a mid-character trim would produce.
+            expect(!tail.contains("\u{FFFD}"),
+                   "tail(bytes: \(size)) contains U+FFFD — trimmed mid-character")
+        }
+    }
+
+    // A line longer than the window leaves no newline to trim at, so the tail would
+    // be a fragment that no JSON line parses out of. Fall back to the whole file.
+    static func tailFallsBackWhenNoNewlineInWindow() async {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tui-test-longline-\(UUID().uuidString).jsonl")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let body = "{\"rate_limits\":{\"primary\":{\"used_percent\":42}}}" +
+                   String(repeating: "x", count: 4_000)
+        do {
+            try body.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            fail("could not write long-line test fixture: \(error)")
+            return
+        }
+        // Window far smaller than the single line it contains.
+        guard let tail = tailOfFile(url, bytes: 100) else {
+            fail("tail must fall back to the whole file, got nil")
+            return
+        }
+        expect(tail.contains("rate_limits"),
+               "fallback should return the whole line so rate_limits is still findable")
     }
 
     // Tail must be cheap: a 5 MB log, a 64 KB tail. Verify the function returns

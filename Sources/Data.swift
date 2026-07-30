@@ -580,6 +580,14 @@ func newestCodexSession() -> URL? {
 // session logs can reach tens of MB; the latest `rate_limits` line is almost always
 // in the last few KB, so this gives us the same answer in a tiny fraction of the I/O
 // and decoding work. If we start mid-line, drop the first partial line.
+//
+// The partial-line trim happens on *bytes*, before decoding, and that ordering is
+// load-bearing. A 64 KB window opens wherever it opens, and session logs are mostly
+// prompt text — emoji, accents, CJK — so the window routinely starts inside a
+// multi-byte character. Decoding first would simply fail there and make a perfectly
+// good log report as "No Codex sessions.". A 0x0A byte can never appear inside a
+// UTF-8 multi-byte sequence (continuation bytes are all ≥ 0x80), so slicing after
+// the first newline lands on a character boundary by construction.
 func tailOfFile(_ url: URL, bytes: Int = 1 << 16) -> String? {
     let fm = FileManager.default
     guard let attrs = try? fm.attributesOfItem(atPath: url.path),
@@ -590,12 +598,21 @@ func tailOfFile(_ url: URL, bytes: Int = 1 << 16) -> String? {
     let offset = UInt64(size - toRead)
     do {
         try handle.seek(toOffset: offset)
-        let data = handle.readData(ofLength: toRead)
-        guard var str = String(data: data, encoding: .utf8) else { return nil }
-        if offset > 0, let nl = str.firstIndex(of: "\n") {
-            str = String(str[str.index(after: nl)...])
+        var data = handle.readData(ofLength: toRead)
+        if offset > 0 {
+            // No newline in the window means a single line longer than `bytes`, so the
+            // tail is a fragment that no JSON line can be parsed out of. Fall back to
+            // the whole file rather than silently reporting no data.
+            guard let nl = data.firstIndex(of: 0x0A) else {
+                guard let whole = try? Data(contentsOf: url) else { return nil }
+                return String(decoding: whole, as: UTF8.self)
+            }
+            data = data[data.index(after: nl)...]
         }
-        return str
+        // Repairing decode rather than the failable one: after the byte trim the slice
+        // starts on a boundary, and a malformed byte in the log itself should cost us
+        // that one line at JSON-parse time, not the entire reading.
+        return String(decoding: data, as: UTF8.self)
     } catch {
         return nil
     }
