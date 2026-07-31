@@ -10,6 +10,7 @@ struct ThrottleTests {
     static func run() async {
         await firstRefreshRuns()
         await withinMinSpacingDefers()
+        await canFetchNowMatchesTheGate()
         await rateLimitedAppliesCooldown()
         await rateLimitedEscalates()
         await successResetsStrikes()
@@ -18,6 +19,7 @@ struct ThrottleTests {
         await requestRefreshHonoursBaseGap()
         await non429FailureDoesNotCooldown()
         await lastGoodFallbackOnFailure()
+        await fetchOutcomeFlagOutlivesLastGoodFallback()
     }
 
     // The happy path: nothing in flight, plenty of time since last fetch — refresh
@@ -45,6 +47,22 @@ struct ThrottleTests {
         // Second refresh inside the window must NOT call the fetcher again.
         await store.refresh()
         expectEqual(fetcher.claudeCalls, 1, "second fetch inside minSpacing must be deferred")
+    }
+
+    // `canFetchNow` has to agree with the gate it describes — the refresh button reads it
+    // to decide whether a tap will produce a spin or go straight to the checkmark, so a
+    // disagreement would show the wrong animation for what actually happened.
+    static func canFetchNowMatchesTheGate() async {
+        let fetcher = MockFetcher()
+        let store = makeStore(fetcher: fetcher)
+        store.minSpacing = 30
+        let t0 = Date()
+        store.now = { t0 }
+        expectEqual(store.canFetchNow, true, "nothing sent yet — a tap should fetch")
+        await store.refresh()
+        expectEqual(store.canFetchNow, false, "inside minSpacing a tap sends nothing")
+        store.now = { t0.addingTimeInterval(31) }
+        expectEqual(store.canFetchNow, true, "past minSpacing a tap fetches again")
     }
 
     // A 429 increments rlStrikes and sets nextAllowed to now + the matching
@@ -210,5 +228,33 @@ struct ThrottleTests {
         expectEqual(claude?.metrics.first?.percent ?? 0, 42,
                     "failed read should fall back to last good reading")
         expectNil(claude?.failed, "last-good fallback should clear the failure state")
+    }
+
+    // `lastFetchFailed` is the refresh button's only source for its outcome morph, and
+    // it has to survive exactly the case above: the last-good fallback scrubs `failed`
+    // off the tool, so reading the flag is the only way to know the fetch went wrong.
+    static func fetchOutcomeFlagOutlivesLastGoodFallback() async {
+        let store = makeStore()
+        store.minSpacing = 0
+        let good = tool("Claude", logo: "claude", accent: CLAUDE_ACCENT,
+                        label: "Weekly", percent: 42)
+        store.fetcher = MockFetcher(claude: good, codex: good, opencode: good)
+        await store.refresh()
+        expectEqual(store.lastFetchFailed, false, "a clean fetch should not report failure")
+
+        store.fetcher = MockFetcher(claude: failingTool("Claude", logo: "claude",
+                                                         accent: CLAUDE_ACCENT,
+                                                         message: "Offline."),
+                                     codex: good, opencode: good)
+        await store.refresh()
+        expectEqual(store.lastFetchFailed, true,
+                    "a failed provider should set the flag even though tools hides it")
+        expectNil(store.tools.first(where: { $0.name == "Claude" })?.failed,
+                  "…and the flag is needed precisely because the tool looks fine")
+
+        // The flag is about the *last* fetch only — a clean one clears it again.
+        store.fetcher = MockFetcher(claude: good, codex: good, opencode: good)
+        await store.refresh()
+        expectEqual(store.lastFetchFailed, false, "a later clean fetch should clear the flag")
     }
 }

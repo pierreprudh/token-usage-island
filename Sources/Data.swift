@@ -91,6 +91,13 @@ final class UsageStore: ObservableObject {
     @Published var lastUpdated: Date?
     @Published var loading = false
 
+    // Did the fetch that just finished come back with any provider in error? `absorb`
+    // deliberately hides those failures behind the last good reading, so `tools` can't
+    // answer this — the refresh button is the only place a failed fetch can surface, and
+    // it reads this on the falling edge of `loading`. Set before `loading` clears so the
+    // two land in the same view update.
+    @Published var lastFetchFailed = false
+
     // Injectable seams. `now` defaults to `Date()`; tests pin it for deterministic
     // timing. `fetcher` defaults to `LiveFetcher`; tests pass a mock.
     var now: () -> Date = { Date() }
@@ -147,6 +154,12 @@ final class UsageStore: ObservableObject {
     private var flushTask: Task<Void, Never>?
     var nextAllowed = Date.distantPast
     var minSpacing: TimeInterval = 30
+
+    // Would a refresh right now actually send, or would the gate swallow it? The refresh
+    // button asks before it calls, because a swallowed refresh returns without ever
+    // touching `loading` — so nothing downstream of `loading` can tell that a tap
+    // happened, and the button has to answer that tap itself.
+    var canFetchNow: Bool { now() >= nextAllowed }
     var rlStrikes = 0
     var coolDowns: [TimeInterval] = [45, 120, 300, 900, 1800]
 
@@ -201,6 +214,7 @@ final class UsageStore: ObservableObject {
 
         absorb(fresh)
         self.lastUpdated = self.now()
+        self.lastFetchFailed = fresh.contains { $0.failed != nil }
         self.loading = false
 
         // 429 recovery: go fully silent for a cooldown (measured recovery ≈ 20–30 s,

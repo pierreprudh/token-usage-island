@@ -696,7 +696,7 @@ struct IconButtonStyle: ButtonStyle {
 
 // MARK: - Refresh control
 
-// Two honest states, each with the system's own motion:
+// Every tap ends in a morph, and the states are honest about what happened in between:
 //
 //   every tap        — press dip + SF Symbols' native `.bounce`. Instant, and it doesn't
 //                      claim work happened, which matters because fetches are rate-gated:
@@ -706,8 +706,11 @@ struct IconButtonStyle: ButtonStyle {
 //   request in flight — the arrow turns: winds up, holds a beat for as long as the fetch
 //                      takes, then coasts to rest. Also covers fetches we didn't ask for
 //                      (file activity, the 15-min backstop, a deferred retry landing).
+//   tap, gate closed  — no turn, because nothing was sent. Straight to the checkmark: we
+//                      fetched inside the last 30 s, so the numbers on screen are current,
+//                      which is all the checkmark ever claims.
 //   fetch landed     — the glyph morphs into its outcome, a checkmark or an exclamation
-//                      mark, holds long enough to read, then morphs back to the arrow.
+//                      mark, holds 1.5–2 s, then morphs back to the arrow.
 //                      This is the only place a failed provider shows up at all: the card
 //                      keeps displaying its last good numbers, so without this the arrow
 //                      settled identically whether the fetch worked or not.
@@ -740,7 +743,21 @@ struct RefreshButton: View {
     @State private var outcomeTask: Task<Void, Never>?
 
     var body: some View {
-        Button { action(); taps += 1 } label: {
+        Button {
+            // Ask before tapping, because most taps send nothing: the gate holds
+            // requests to one per 30 s (longer after a 429) and a swallowed refresh
+            // returns without ever setting `loading`, so the falling edge below never
+            // fires. Those taps still deserve the outcome morph — if we fetched inside
+            // the last 30 s the numbers on screen are current, which is exactly what
+            // the checkmark says. Without this the morph only ever appeared on the
+            // rare tap that happened to land outside the window.
+            let willFetch = store.canFetchNow
+            action()
+            taps += 1
+            if !willFetch && !store.loading {
+                showOutcome(failed: store.lastFetchFailed, afterSpin: false)
+            }
+        } label: {
             Image(systemName: outcome?.glyph ?? "arrow.clockwise")
                 .font(.system(size: 10.5, weight: .semibold))
                 .foregroundStyle(glyphStyle)
@@ -765,7 +782,7 @@ struct RefreshButton: View {
                 withAnimation(.snappy(duration: 0.2)) { outcome = nil }
                 startTurning()
             } else {
-                showOutcome(failed: store.lastFetchFailed)
+                showOutcome(failed: store.lastFetchFailed, afterSpin: true)
             }
         }
         .accessibilityLabel(accessibilityLabel)
@@ -807,13 +824,19 @@ struct RefreshButton: View {
     // has spent most of its rotation, so the new glyph arrives as the arrow slows instead
     // of fighting it, and lands upright. Under Reduce Motion there's no turn to wait for,
     // so it swaps straight away — `.replace` is a cross-fade, which that setting allows.
-    private func showOutcome(failed: Bool) {
+    //
+    // Then it holds: 1.5 s for a checkmark, 2 s for a failure, which is long enough to
+    // notice and read without the button sitting on a stale answer. Only after that does
+    // it morph back to the arrow, so the button always ends up offering the action again.
+    private func showOutcome(failed: Bool, afterSpin: Bool) {
         outcomeTask?.cancel()
         outcomeTask = Task { @MainActor in
-            if !reduceMotion { try? await Task.sleep(for: .milliseconds(450)) }
+            // Only a fetch that actually ran leaves a turn to settle. A tap the gate
+            // swallowed has no spin behind it, so the V lands immediately.
+            if afterSpin && !reduceMotion { try? await Task.sleep(for: .milliseconds(450)) }
             guard !Task.isCancelled else { return }
             withAnimation(.snappy(duration: 0.3)) { outcome = failed ? .failed : .ok }
-            try? await Task.sleep(for: .milliseconds(failed ? 1600 : 900))
+            try? await Task.sleep(for: .milliseconds(failed ? 2000 : 1500))
             guard !Task.isCancelled else { return }
             withAnimation(.snappy(duration: 0.3)) { outcome = nil }
             outcomeTask = nil
