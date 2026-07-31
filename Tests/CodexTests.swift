@@ -20,6 +20,10 @@ struct CodexTests {
         await tailFallsBackWhenNoNewlineInWindow()
         await tailOfLargeFileIsFast()
         await tailOfMissingFileIsNil()
+        await tailContainingFindsNeedleBeyondFirstWindow()
+        await tailContainingStopsAtWholeFileWhenNeedleAbsent()
+        await tailContainingOfMissingFileIsNil()
+        await tailContainingCostsOneWindowWhenNeedleIsNearTheEnd()
     }
 
     // The slot on the Metric is what disambiguates two same-label metrics in
@@ -154,5 +158,102 @@ struct CodexTests {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("tui-test-missing-\(UUID().uuidString).jsonl")
         expectNil(tailOfFile(url))
+    }
+
+    // Writes a log whose only `rate_limits` line sits `tailBytes` from the end,
+    // buried under filler — the shape of the real session that broke v1.2.3.
+    private static func writeBuriedLog(needleDistanceFromEnd: Int) -> URL? {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tui-test-buried-\(UUID().uuidString).jsonl")
+        let rl = "{\"rate_limits\":{\"primary\":{\"used_percent\":21}}}"
+        let filler = "{\"type\":\"item\",\"text\":\"" + String(repeating: "z", count: 200) + "\"}"
+        var trailing = ""
+        while trailing.utf8.count < needleDistanceFromEnd {
+            trailing += filler + "\n"
+        }
+        let body = filler + "\n" + rl + "\n" + trailing
+        do {
+            try body.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            fail("could not write buried-needle fixture: \(error)")
+            return nil
+        }
+        return url
+    }
+
+    // The v1.2.3 regression, locked down. A fixed window silently missed a
+    // rate_limits line that was further from EOF than the window was wide, and the
+    // Codex panel read "No rate-limit data yet." on a log that had the data.
+    static func tailContainingFindsNeedleBeyondFirstWindow() async {
+        // Needle ~90 KB from the end, mirroring the observed 87 KB. The default
+        // 64 KB starting window cannot see it; growing must.
+        guard let url = writeBuriedLog(needleDistanceFromEnd: 90_000) else { return }
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        // Precondition: the plain fixed-window read really does miss it. If this
+        // ever stops holding, the test below is no longer proving anything.
+        let fixed = tailOfFile(url, bytes: 1 << 16)
+        expect(!(fixed?.contains("rate_limits") ?? false),
+               "fixture must bury the needle outside a 64 KB window, else this test is vacuous")
+
+        guard let grown = tailContaining(url, needle: "rate_limits") else {
+            fail("tailContaining returned nil on a file that contains the needle")
+            return
+        }
+        expect(grown.contains("rate_limits"),
+               "tailContaining must grow its window until the needle is found")
+        // And the found line must still parse — a grown window that starts mid-line
+        // would hand JSONSerialization a fragment.
+        let hit = grown.split(separator: "\n").last { $0.contains("rate_limits") }
+        expectNotNil(hit, "the needle line should survive the partial-line trim")
+        if let hit, let d = hit.data(using: .utf8) {
+            expectNotNil(try? JSONSerialization.jsonObject(with: d),
+                         "the recovered rate_limits line must be complete JSON")
+        }
+    }
+
+    // No needle anywhere: return the whole file rather than nil, so the caller can
+    // tell "session with no rate-limit data" from "no session at all". They surface
+    // as different messages.
+    static func tailContainingStopsAtWholeFileWhenNeedleAbsent() async {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tui-test-noneedle-\(UUID().uuidString).jsonl")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let body = (1...500).map { "{\"type\":\"item\",\"n\":\($0)}" }.joined(separator: "\n")
+        do {
+            try body.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            fail("could not write no-needle fixture: \(error)")
+            return
+        }
+        let out = tailContaining(url, needle: "rate_limits")
+        expectNotNil(out, "a readable file with no needle must still return its text")
+        expect(!(out?.contains("rate_limits") ?? true), "there is no needle to find")
+    }
+
+    static func tailContainingOfMissingFileIsNil() async {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tui-test-cmissing-\(UUID().uuidString).jsonl")
+        expectNil(tailContaining(url, needle: "rate_limits"),
+                  "a missing session must stay nil so the fetcher says 'No Codex sessions.'")
+    }
+
+    // The optimisation must survive the fix: when the line is near the end — the
+    // common case of an active session — we should still read only the first window,
+    // not escalate to the whole multi-MB file.
+    static func tailContainingCostsOneWindowWhenNeedleIsNearTheEnd() async {
+        guard let url = writeBuriedLog(needleDistanceFromEnd: 2_000) else { return }
+        defer { try? FileManager.default.removeItem(at: url) }
+        guard let out = tailContaining(url, needle: "rate_limits") else {
+            fail("tailContaining returned nil on a file that contains the needle")
+            return
+        }
+        expect(out.contains("rate_limits"), "needle near the end must be found")
+        // Returned text should be about one window, not the whole file — proof we
+        // stopped growing as soon as we had a hit.
+        let size = (try? FileManager.default.attributesOfItem(atPath: url.path))
+            .flatMap { $0[.size] as? Int } ?? 0
+        expect(out.utf8.count <= (1 << 16),
+               "should have stopped at the first 64 KB window, got \(out.utf8.count) of \(size) bytes")
     }
 }

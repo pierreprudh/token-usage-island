@@ -511,7 +511,7 @@ func _fetchCodex() async -> Tool {
     var tool = Tool(name: "Codex", logoKey: "codex", accent: CODEX_ACCENT, metrics: [], subtitle: nil, failed: nil)
 
     guard let fileURL = newestCodexSession(),
-          let content = tailOfFile(fileURL, bytes: 1 << 16) else {     // 64 KB tail
+          let content = tailContaining(fileURL, needle: "rate_limits") else {
         tool.failed = "No Codex sessions."
         return tool
     }
@@ -615,6 +615,35 @@ func tailOfFile(_ url: URL, bytes: Int = 1 << 16) -> String? {
         return String(decoding: data, as: UTF8.self)
     } catch {
         return nil
+    }
+}
+
+// Return the smallest tail of `url` that contains `needle`, growing the window until
+// it turns up (or the whole file has been read).
+//
+// A fixed 64 KB tail was wrong, and shipped broken in v1.2.3. Codex writes a
+// `rate_limits` line on each API turn, but a session keeps appending afterwards —
+// tool output, local events, a long final assistant message — so "the last few KB"
+// is not a safe bet. A real 766 KB log had its last `rate_limits` 87 KB from EOF:
+// outside the window, so Codex reported "No rate-limit data yet." while the data sat
+// right there in the file.
+//
+// Growing keeps the optimisation's point. The common case — an active session whose
+// last turn is near the end — still costs a single 64 KB read; only logs that bury
+// the line pay for more, and the ceiling is the file itself.
+func tailContaining(_ url: URL, needle: String,
+                    from start: Int = 1 << 16, upTo limit: Int = 1 << 24) -> String? {
+    let size = (try? FileManager.default.attributesOfItem(atPath: url.path))
+        .flatMap { $0[.size] as? Int } ?? 0
+    guard size > 0 else { return nil }
+    var window = min(start, size)
+    while true {
+        guard let text = tailOfFile(url, bytes: window) else { return nil }
+        // Found it, or we've already read everything there is to read. Returning the
+        // text either way lets the caller distinguish "no rate-limit data in this
+        // session" from "no session at all" — the two report differently.
+        if text.contains(needle) || window >= size || window >= limit { return text }
+        window = min(window * 4, min(size, limit))
     }
 }
 
