@@ -180,7 +180,7 @@ struct MacModel {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let store = UsageStore()
     let state = IslandState()
     let model = MacModel.detect()
@@ -222,6 +222,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.hasShadow = false   // no halo around the notch tab; the card draws its own shadow
         panel.hidesOnDeactivate = false
         panel.contentView = hosting
+        // AppKit resizes this panel on its own whenever the hosting view's intrinsic
+        // content size changes, and anchors that resize at the window's bottom-left.
+        // windowDidResize re-anchors it to top-centre in the same pass — see there.
+        panel.delegate = self
         self.window = panel
 
         // NB: no orderFront here — the first successful reposition() reveals the
@@ -397,18 +401,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         reposition(animated: true)
     }
 
+    // Where a window of this size must sit: horizontally centred on the screen, top
+    // edge hugging the notch. Anchor the top just under the menu bar — on a notched
+    // Mac this hugs the notch; otherwise it hangs cleanly below the menu bar. Use the
+    // same notch verdict the view uses so tab and window always agree.
+    func anchoredOrigin(for size: CGSize, on screen: NSScreen) -> NSPoint {
+        let menuBarH = screen.frame.maxY - screen.visibleFrame.maxY
+        let topAnchor = state.hasNotch ? screen.frame.maxY : (screen.frame.maxY - menuBarH + 2)
+        return NSPoint(x: screen.frame.midX - size.width / 2, y: topAnchor - size.height)
+    }
+
+    // AppKit resizes this panel behind our back: NSHostingView is the contentView, so
+    // its intrinsic content size drives a window resize — and AppKit anchors that at
+    // the window's BOTTOM-LEFT. Opening the card therefore grew the window ~115pt
+    // rightward and downward the instant the card entered the view tree, a runloop tick
+    // before our own centred reposition() could run, so the card appeared ~57pt right
+    // of the notch and then slid back. Traced: at entry to the expand handler the
+    // window was already 340 wide but still at x=643, the x for a 225-wide window.
+    //
+    // Re-anchoring here fixes the whole class of it — any resize, whoever caused it,
+    // lands top-centred. setFrameOrigin only moves the window, so this cannot recurse
+    // back into windowDidResize.
+    func windowDidResize(_ notification: Notification) {
+        guard let window, let screen = targetScreen() else { return }
+        let origin = anchoredOrigin(for: window.frame.size, on: screen)
+        if window.frame.origin != origin { window.setFrameOrigin(origin) }
+    }
+
     func reposition(animated: Bool = false) {
         guard let screen = targetScreen(), currentSize.width > 1 else { return }
         let w = currentSize.width
         let h = currentSize.height
-        let x = screen.frame.midX - w / 2
-        // Anchor the top just under the menu bar. On a notched Mac this hugs the
-        // notch; otherwise it hangs cleanly below the menu bar. Use the same
-        // notch verdict the view uses so tab and window always agree.
-        let menuBarH = screen.frame.maxY - screen.visibleFrame.maxY
-        let topAnchor = state.hasNotch ? screen.frame.maxY : (screen.frame.maxY - menuBarH + 2)
-        let y = topAnchor - h
-        let frame = NSRect(x: x, y: y, width: w, height: h)
+        let origin = anchoredOrigin(for: currentSize, on: screen)
+        let frame = NSRect(x: origin.x, y: origin.y, width: w, height: h)
         // Hand the hover backstop the frame we're about to adopt. Set before the
         // setFrame calls below so the animated path can't leave it a frame behind.
         state.windowFrame = frame
