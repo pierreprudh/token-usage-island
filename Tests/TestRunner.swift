@@ -139,6 +139,7 @@ struct TestMain {
         await MilestoneTests.run()
         await ThrottleTests.run()
         await CodexTests.run()
+        await HoverTests.run()
         let code = runner.report()
         exit(code)
     }

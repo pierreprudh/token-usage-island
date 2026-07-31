@@ -33,6 +33,14 @@ enum IslandSize {
     static let minRevealW: CGFloat = 176
 }
 
+// Has the pointer plainly left the island? Pure so the boundary rules are testable
+// without a window: a frame we haven't measured yet (.zero) must never count as
+// "left", or the backstop would retract the lip before the first layout lands.
+func pointerHasLeft(_ pointer: CGPoint, windowFrame: CGRect) -> Bool {
+    guard windowFrame.width > 1, windowFrame.height > 1 else { return false }
+    return !windowFrame.contains(pointer)
+}
+
 @MainActor
 final class IslandState: ObservableObject {
     @Published var expanded = false
@@ -43,6 +51,10 @@ final class IslandState: ObservableObject {
     @Published var notchHeight: CGFloat = 32
     // QA only: force the lip/card open for screenshots (TUI_PREVIEW=1).
     @Published var forceReveal = false
+    // Live window frame in screen coordinates, kept current by AppDelegate.reposition().
+    // Deliberately NOT @Published: it changes on every interpolated frame of a resize,
+    // and its only reader is the hover backstop, which polls it rather than observing.
+    var windowFrame: CGRect = .zero
     // One-shot launch greeting: the tab reveals, plays a loading bar, then settles.
     @Published var launching = false
     // One-shot milestone pulse: the tab reveals and glows when a new 10% band is hit.
@@ -130,6 +142,39 @@ struct IslandView: View {
                 withAnimation(.spring(response: 0.30, dampingFraction: 0.52)) {
                     hovered = false
                 }
+                if state.expanded && !state.pinned {
+                    withAnimation(.spring(response: 0.32, dampingFraction: 0.7)) {
+                        state.expanded = false
+                    }
+                }
+            }
+        }
+        // Ground-truth backstop for a stuck lip.
+        //
+        // `hovered` comes from SwiftUI tracking areas, and this window resizes *because
+        // of* hover — updateWindowSize() calls setFrame on every interpolated frame of
+        // the reveal. Tracking areas rebuilt mid-resize can drop the exit, and then the
+        // lip stays open with the pointer nowhere near it. The two handlers above are
+        // both already patches on that same unreliable signal; this one doesn't trust it
+        // at all and asks the OS where the pointer actually is.
+        //
+        // `.task(id:)` ties the poll's lifetime to the state it polices, so it starts on
+        // reveal and is cancelled automatically on retract — nothing runs at rest.
+        .task(id: hovered || state.expanded) {
+            guard hovered || state.expanded else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                if Task.isCancelled { return }
+                guard pointerHasLeft(NSEvent.mouseLocation, windowFrame: state.windowFrame),
+                      draggingTool == nil          // a drag owns the pointer, even outside
+                else { continue }
+                if hovered {
+                    withAnimation(.spring(response: 0.30, dampingFraction: 0.52)) {
+                        hovered = false
+                    }
+                }
+                // Pin means "keep the card open", not "keep the hover lift" — so the lip
+                // retracts above either way, but only an unpinned card closes.
                 if state.expanded && !state.pinned {
                     withAnimation(.spring(response: 0.32, dampingFraction: 0.7)) {
                         state.expanded = false
@@ -661,27 +706,47 @@ struct IconButtonStyle: ButtonStyle {
 //   request in flight — the arrow turns: winds up, holds a beat for as long as the fetch
 //                      takes, then coasts to rest. Also covers fetches we didn't ask for
 //                      (file activity, the 15-min backstop, a deferred retry landing).
+//   fetch landed     — the glyph morphs into its outcome, a checkmark or an exclamation
+//                      mark, holds long enough to read, then morphs back to the arrow.
+//                      This is the only place a failed provider shows up at all: the card
+//                      keeps displaying its last good numbers, so without this the arrow
+//                      settled identically whether the fetch worked or not.
 //
 // The turning is hand-driven rather than `.symbolEffect(.rotate)` because that effect is
 // macOS 15+ (we ship 14+) and only animates layers a symbol marks "Can Rotate" —
 // arrow.clockwise has none, so it renders as a no-op. Accumulating whole 360° turns is
 // what Apple's own forum thread on that lands on, and because `spin` only ever counts up
 // in whole turns the glyph never rewinds and never rests askew.
+//
+// The morph, by contrast, is the system's: `.contentTransition(.symbolEffect(.replace))`
+// is macOS 14, and unlike `.rotate` it works on any pair of symbols because it animates
+// the swap rather than the glyph's internals.
 struct RefreshButton: View {
     @ObservedObject var store: UsageStore
     var action: () -> Void
+
+    // What the last fetch came back with. `nil` is the resting arrow.
+    private enum Outcome {
+        case ok, failed
+        var glyph: String { self == .ok ? "checkmark" : "exclamationmark" }
+    }
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var spin: Double = 0
     @State private var taps = 0                  // drives the native bounce
     @State private var hovered = false
+    @State private var outcome: Outcome?
     @State private var spinTask: Task<Void, Never>?
+    @State private var outcomeTask: Task<Void, Never>?
 
     var body: some View {
         Button { action(); taps += 1 } label: {
-            Image(systemName: "arrow.clockwise")
+            Image(systemName: outcome?.glyph ?? "arrow.clockwise")
                 .font(.system(size: 10.5, weight: .semibold))
-                .foregroundStyle(hovered ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+                .foregroundStyle(glyphStyle)
+                // Morph between arrow and outcome. Sits above the rotation so a settling
+                // turn carries the new glyph too, rather than snapping it in upright.
+                .contentTransition(.symbolEffect(.replace.downUp))
                 .symbolEffect(.bounce, options: .speed(1.4), value: taps)
                 // Rotation sits inside the frame so only the glyph turns — the hover
                 // disc behind it holds still.
@@ -692,9 +757,34 @@ struct RefreshButton: View {
         }
         .buttonStyle(IconButtonStyle())
         .onHover { h in withAnimation(.easeOut(duration: 0.14)) { hovered = h } }
-        .onChange(of: store.loading) { _, busy in if busy { startTurning() } }
-        .accessibilityLabel("Refresh usage")
+        .onChange(of: store.loading) { _, busy in
+            if busy {
+                // A fetch starting on top of a lingering outcome: drop back to the arrow
+                // before winding up, so it's never the checkmark that spins.
+                outcomeTask?.cancel()
+                withAnimation(.snappy(duration: 0.2)) { outcome = nil }
+                startTurning()
+            } else {
+                showOutcome(failed: store.lastFetchFailed)
+            }
+        }
+        .accessibilityLabel(accessibilityLabel)
         .help("Refresh")
+    }
+
+    // The failure mark earns the card's own amber; the checkmark stays in the button's
+    // quiet greys, because success is the expected case and doesn't need a colour.
+    private var glyphStyle: AnyShapeStyle {
+        if outcome == .failed { return AnyShapeStyle(Color(red: 0.96, green: 0.68, blue: 0.20)) }
+        return AnyShapeStyle(hovered ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+    }
+
+    private var accessibilityLabel: String {
+        switch outcome {
+        case .ok:     return "Usage refreshed"
+        case .failed: return "Refresh failed"
+        case nil:     return "Refresh usage"
+        }
     }
 
     private func startTurning() {
@@ -710,6 +800,23 @@ struct RefreshButton: View {
             withAnimation(.smooth(duration: 0.7)) { spin += 360 }          // coast to rest
             try? await Task.sleep(for: .milliseconds(700))
             spinTask = nil
+        }
+    }
+
+    // Morph in the outcome partway through the coast-to-rest turn: by ~0.45 s `.smooth`
+    // has spent most of its rotation, so the new glyph arrives as the arrow slows instead
+    // of fighting it, and lands upright. Under Reduce Motion there's no turn to wait for,
+    // so it swaps straight away — `.replace` is a cross-fade, which that setting allows.
+    private func showOutcome(failed: Bool) {
+        outcomeTask?.cancel()
+        outcomeTask = Task { @MainActor in
+            if !reduceMotion { try? await Task.sleep(for: .milliseconds(450)) }
+            guard !Task.isCancelled else { return }
+            withAnimation(.snappy(duration: 0.3)) { outcome = failed ? .failed : .ok }
+            try? await Task.sleep(for: .milliseconds(failed ? 1600 : 900))
+            guard !Task.isCancelled else { return }
+            withAnimation(.snappy(duration: 0.3)) { outcome = nil }
+            outcomeTask = nil
         }
     }
 }

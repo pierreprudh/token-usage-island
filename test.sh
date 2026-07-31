@@ -23,7 +23,8 @@ if [ "${1:-}" != "--no-build" ]; then
         -framework AppKit -framework SwiftUI -framework Combine \
         Sources/Data.swift Sources/IslandView.swift \
         Tests/TestRunner.swift Tests/TestSupport.swift \
-        Tests/MilestoneTests.swift Tests/ThrottleTests.swift Tests/CodexTests.swift
+        Tests/MilestoneTests.swift Tests/ThrottleTests.swift Tests/CodexTests.swift \
+        Tests/HoverTests.swift
 fi
 
 exec "$BUILD"

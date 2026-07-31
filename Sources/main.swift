@@ -409,6 +409,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let topAnchor = state.hasNotch ? screen.frame.maxY : (screen.frame.maxY - menuBarH + 2)
         let y = topAnchor - h
         let frame = NSRect(x: x, y: y, width: w, height: h)
+        // Hand the hover backstop the frame we're about to adopt. Set before the
+        // setFrame calls below so the animated path can't leave it a frame behind.
+        state.windowFrame = frame
         if !didAppear {
             // First real layout: snap straight to the notch (no animation) and only
             // then reveal the panel, so launch is a clean spawn in place.
