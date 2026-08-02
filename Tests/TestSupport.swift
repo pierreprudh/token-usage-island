@@ -1,5 +1,4 @@
 import Foundation
-import SwiftUI
 
 // A fetcher that returns canned Tool values and records each call. Tests inject this
 // into UsageStore so refresh() exercises the throttle/queue logic without touching
@@ -57,7 +56,7 @@ func makeStore(fetcher: MockFetcher? = nil, now: Date = Date(timeIntervalSince19
 }
 
 // Tool with a single percent metric.
-func tool(_ name: String, logo: String, accent: Color, label: String,
+func tool(_ name: String, logo: String, accent: RGB, label: String,
            percent: Double, slot: String? = nil) -> Tool {
     Tool(name: name, logoKey: logo, accent: accent,
          metrics: [Metric(label: label, percent: percent, detail: "", slot: slot)],
@@ -65,7 +64,7 @@ func tool(_ name: String, logo: String, accent: Color, label: String,
 }
 
 // Tool with an explicit failure message (so absorb() falls back to lastGood).
-func failingTool(_ name: String, logo: String, accent: Color, message: String) -> Tool {
+func failingTool(_ name: String, logo: String, accent: RGB, message: String) -> Tool {
     Tool(name: name, logoKey: logo, accent: accent,
          metrics: [], subtitle: nil, failed: message)
 }

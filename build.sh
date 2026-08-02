@@ -17,11 +17,41 @@ echo "▸ Compiling…"
 rm -rf "$BUILD_DIR"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-swiftc -O \
-  -o "$APP/Contents/MacOS/$BIN_NAME" \
-  Sources/Data.swift Sources/IslandView.swift Sources/main.swift \
-  -framework AppKit -framework SwiftUI -framework Combine -framework CoreServices \
-  -target arm64-apple-macos14.0
+# Universal binary. The notch UI needs an Apple Silicon MacBook, but the app is
+# supposed to run on any Mac from macOS 14 — on a display without a notch it falls
+# back to a floating card below the menu bar. An arm64-only build made that promise
+# untrue for Intel Macs, which couldn't launch it at all. Each slice is compiled
+# separately and lipo'd, because swiftc emits one architecture per invocation.
+#
+# Two binaries come out of this. The island is the app; `usage-status` is the same
+# readings without a GUI, and it is compiled from the core WITHOUT Store.swift or
+# anything under Sources/App. That list is the point: if the fetch layer ever grows a
+# SwiftUI or AppKit dependency, the CLI target stops building, so the separation that
+# makes a port possible is enforced here rather than trusted.
+PORTABLE=(Sources/Core/Models.swift Sources/Core/Platform.swift Sources/Core/Fetchers.swift)
+CORE=("${PORTABLE[@]}" Sources/Core/Store.swift)
+APP_SOURCES=("${CORE[@]}" Sources/App/Appearance.swift Sources/App/IslandView.swift Sources/App/main.swift)
+CLI_SOURCES=("${PORTABLE[@]}" Sources/CLI/main.swift)
+FRAMEWORKS=(-framework AppKit -framework SwiftUI -framework Combine -framework CoreServices)
+ARCHS=(arm64 x86_64)
+CLI_NAME="usage-status"
+
+# Compile one target for every arch and lipo the slices together.
+# $1 output path · $2 name for the temp slices · rest: swiftc arguments
+build_universal() {
+  local out="$1" tag="$2"; shift 2
+  local slices=() arch
+  for arch in "${ARCHS[@]}"; do
+    swiftc -O -o "$BUILD_DIR/$tag-$arch" "$@" -target "$arch-apple-macos14.0"
+    slices+=("$BUILD_DIR/$tag-$arch")
+  done
+  lipo -create "${slices[@]}" -output "$out"
+  rm -f "${slices[@]}"
+  echo "  · $tag: $(lipo -archs "$out")"
+}
+
+build_universal "$APP/Contents/MacOS/$BIN_NAME" "$BIN_NAME" "${APP_SOURCES[@]}" "${FRAMEWORKS[@]}"
+build_universal "$APP/Contents/MacOS/$CLI_NAME" "$CLI_NAME" "${CLI_SOURCES[@]}"
 
 echo "▸ Copying resources…"
 cp Resources/* "$APP/Contents/Resources/"
@@ -55,6 +85,18 @@ cat > "$APP/Contents/Resources/usage" <<LAUNCH
 # CLI launcher for $APP_NAME. Installed on PATH as \`usage\`.
 APP="$APP_NAME"
 
+# Resolve this script through any symlinks — Homebrew links it onto PATH — so the
+# sibling binaries inside the bundle can be found wherever the app is installed,
+# rather than assuming /Applications.
+SRC="\${BASH_SOURCE[0]}"
+while [ -L "\$SRC" ]; do
+  LDIR="\$(cd -P "\$(dirname "\$SRC")" && pwd)"
+  SRC="\$(readlink "\$SRC")"
+  case "\$SRC" in /*) ;; *) SRC="\$LDIR/\$SRC" ;; esac
+done
+RES_DIR="\$(cd -P "\$(dirname "\$SRC")" && pwd)"
+STATUS_BIN="\$RES_DIR/../MacOS/usage-status"
+
 print_help() {
   cat <<'HELP'
 usage — control $APP_NAME from the terminal
@@ -64,18 +106,30 @@ USAGE
 
 COMMANDS
     island     Launch the app (default)
+    status     Print usage in the terminal, no GUI  (--watch, --json)
     off        Turn the app off        (aliases: quit, stop)
     restart    Relaunch the app
     version    Print the installed version
     help       Show this help
 
 EXAMPLES
-    usage island     # start it
-    usage off        # stop it
+    usage island          # start it
+    usage status          # read the numbers here in the terminal
+    usage status --watch  # keep them updating
+    usage off             # stop it
 HELP
 }
 
 case "\${1:-island}" in
+  status|stat)
+    # Headless read of the same three providers. Runs whether or not the app is up —
+    # it reads the same files and endpoint, it just prints instead of drawing.
+    shift
+    if [ ! -x "\$STATUS_BIN" ]; then
+      echo "usage: status helper not found at \$STATUS_BIN" >&2
+      exit 1
+    fi
+    exec "\$STATUS_BIN" "\$@" ;;
   island|start|open|"")
     # -g: launch WITHOUT foreground-activating. The app lives in the notch and never
     # wants app focus; activating it makes WindowServer flash the Spaces bar on launch.
@@ -114,6 +168,7 @@ cat > "$APP/Contents/Resources/_usage" <<'COMPLETION'
 local -a cmds
 cmds=(
   'island:Launch the app'
+  'status:Print usage in the terminal'
   'off:Turn the app off'
   'restart:Relaunch the app'
   'version:Print the installed version'

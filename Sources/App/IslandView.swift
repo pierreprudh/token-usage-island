@@ -404,7 +404,7 @@ struct IslandView: View {
                 Button { state.pinned.toggle() } label: {
                     Image(systemName: state.pinned ? "pin.fill" : "pin")
                         .font(.system(size: 10.5, weight: .semibold))
-                        .foregroundStyle(state.pinned ? CLAUDE_ACCENT : Color.secondary)
+                        .foregroundStyle(state.pinned ? Color(CLAUDE_ACCENT) : Color.secondary)
                         .frame(width: 19, height: 19)
                         .contentShape(Circle())
                 }
@@ -570,12 +570,12 @@ struct IslandView: View {
 
     // A compact stat for the hover lip: percentage first, faint time label after ("12% 5h").
     @ViewBuilder
-    private func lipStat(_ label: String, _ pct: Double?, accent: Color) -> some View {
+    private func lipStat(_ label: String, _ pct: Double?, accent: RGB) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 2.5) {
             if let p = pct {
                 Text("\(Int(p.rounded()))%")
                     .font(.system(size: 11.5, weight: .semibold, design: .rounded))
-                    .foregroundStyle(barColor(p, accent: accent))
+                    .foregroundStyle(barTint(p, accent: accent))
             } else {
                 Text("—")
                     .font(.system(size: 11.5, weight: .semibold))
@@ -855,7 +855,7 @@ struct RowFrameKey: PreferenceKey {
 
 struct MetricRow: View {
     let metric: Metric
-    let accent: Color
+    let accent: RGB
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3.5) {
@@ -879,7 +879,7 @@ struct MetricRow: View {
                         .fill(Color.primary.opacity(0.10))
                         .overlay(alignment: .leading) {
                             Capsule()
-                                .fill(barColor(p, accent: accent))
+                                .fill(barTint(p, accent: accent))
                                 .frame(width: max(3, geo.size.width * CGFloat(min(p, 100) / 100)))
                         }
                 }

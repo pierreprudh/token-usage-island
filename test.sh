@@ -21,7 +21,9 @@ if [ "${1:-}" != "--no-build" ]; then
         -o "$BUILD" \
         -target "$TARGET" \
         -framework AppKit -framework SwiftUI -framework Combine \
-        Sources/Data.swift Sources/IslandView.swift \
+        Sources/Core/Models.swift Sources/Core/Platform.swift \
+        Sources/Core/Fetchers.swift Sources/Core/Store.swift \
+        Sources/App/Appearance.swift Sources/App/IslandView.swift \
         Tests/TestRunner.swift Tests/TestSupport.swift \
         Tests/MilestoneTests.swift Tests/ThrottleTests.swift Tests/CodexTests.swift \
         Tests/HoverTests.swift

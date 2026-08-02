@@ -76,11 +76,36 @@ control the app from any terminal:
 
 ```bash
 usage island     # launch the app
+usage status     # print the numbers here in the terminal — no GUI
 usage off        # turn it off       (aliases: quit, stop)
 usage restart    # relaunch it
 usage version    # print the installed version
 usage help       # show all commands
 ```
+
+### `usage status` — the numbers without the island
+
+Same three providers, read the same way, printed instead of drawn. Works whether or not
+the app is running, and on any Mac — no notch required.
+
+```
+$ usage status
+Claude  Team plan
+  Session · 5h  ████░░░░░░░░░░░░░░░░  20%   Resets 03:10
+  Weekly        █░░░░░░░░░░░░░░░░░░░  3%    Resets Sun 06:00
+
+Codex  Plus plan
+  Weekly        ██░░░░░░░░░░░░░░░░░░  9%    Resets Sun 22:22
+
+OpenCode  pay-as-you-go
+  This week                                 $0.84 · 11.7M tok
+```
+
+| Flag | Effect |
+|------|--------|
+| `--watch [seconds]` | Re-read on an interval (default 60, **minimum 30** — the Claude endpoint is shared with the Claude Code CLI and rate-limits per account) |
+| `--json` | Machine-readable output, for scripting and status bars |
+| `--no-color` | Disable ANSI colour (`NO_COLOR` is honoured too) |
 
 > `--no-quarantine` is required because the app is ad-hoc signed (not notarized with an Apple
 > Developer ID); it tells Gatekeeper to trust the download.
@@ -101,7 +126,8 @@ choose **Always Allow**.
 the app via `SMAppService`, no digging through System Settings.
 
 > **Note:** the notch UI needs an Apple Silicon MacBook with a notch. The app still runs on
-> any Mac (macOS 14+) and falls back to a floating card below the menu bar on other displays.
+> any Mac (macOS 14+) and falls back to a floating card below the menu bar on other displays
+> — it ships as a universal binary, so Intel Macs are covered too.
 
 ## Usage
 
@@ -122,7 +148,7 @@ your Keychain. Nothing is sent anywhere else, and there is no telemetry.
 
 ## Requirements
 
-- macOS 14 (Sonoma) or later
+- macOS 14 (Sonoma) or later, Apple Silicon or Intel
 - The Swift toolchain — `xcode-select --install` (to build from source)
 
 ## Development
@@ -131,13 +157,26 @@ your Keychain. Nothing is sent anywhere else, and there is no telemetry.
 
 ```
 Sources/
-  Data.swift        Models, the three usage fetchers, bundled logos
-  IslandView.swift  SwiftUI island — notch tab + Control-Center card
-  main.swift        AppKit panel, notch geometry, positioning
+  Core/               Foundation only — no SwiftUI, no AppKit
+    Models.swift        Metric, Tool, RGB, milestone events, formatting
+    Platform.swift      the ONLY OS-specific file — paths, credentials, SQLite, subprocess
+    Fetchers.swift      the three provider readers
+    Store.swift         throttle, milestone queue, last-good fallback (needs Combine)
+  App/                SwiftUI island — notch tab + Control-Center card
+    Appearance.swift    RGB → Color bridge and the bundled logos
+    IslandView.swift    the island itself
+    main.swift          AppKit panel, notch geometry, positioning
+  CLI/                `usage status` — the same readings, headless
 Resources/          Provider logos (Claude, Codex, OpenCode)
-build.sh            Compile + bundle into a versioned .app
+build.sh            Compile + bundle into a versioned universal .app
 .github/workflows/  release.yml — tag-triggered build + GitHub Release
 ```
+
+**The layer split is enforced by the build, not by convention.** `usage status` is compiled
+from `Core/Models`, `Core/Platform` and `Core/Fetchers` and nothing else — so if the fetch
+layer ever picks up a UI dependency, that target stops compiling. `Core/Store.swift` is the
+one piece still tied to Apple (Combine's `ObservableObject`); porting the readings to another
+OS means reimplementing `Platform.swift` and leaving everything else alone.
 
 ### Testing across MacBooks
 
