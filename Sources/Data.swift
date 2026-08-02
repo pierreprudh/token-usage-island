@@ -5,7 +5,11 @@ import AppKit
 // MARK: - Models
 
 struct Metric: Identifiable {
-    let id = UUID()
+    // Derived, not random. A fresh UUID per value meant every fetch produced
+    // brand-new metrics as far as SwiftUI was concerned, so the card rebuilt each
+    // row on every refresh. Label+slot is what actually makes a metric distinct
+    // within a tool — the same pair the milestone bucket key is built from.
+    var id: String { "\(label)|\(slot ?? "")" }
     let label: String        // "Session · 5h"
     let percent: Double?      // 0...100, nil if not a % metric
     let detail: String        // "Resets 17:30" or "$14.90 · 31M tok"
@@ -22,7 +26,13 @@ struct Metric: Identifiable {
 }
 
 struct Tool: Identifiable {
-    let id = UUID()
+    // The name is already this type's primary key everywhere else: `absorb` matches
+    // on it, `lastGood` and the persisted order are keyed by it, and so are the
+    // milestone buckets. A random UUID here contradicted all of that — the fetchers
+    // build a fresh Tool per call, so the card's ForEach saw three deletions and
+    // three insertions on every refresh. Row hover state reset each time, and a
+    // refresh landing mid-drag orphaned `draggingTool`, freezing the reorder.
+    var id: String { name }
     let name: String
     let logoKey: String       // "claude" / "codex" / "opencode"
     let accent: Color
@@ -154,6 +164,8 @@ final class UsageStore: ObservableObject {
     private var flushTask: Task<Void, Never>?
     var nextAllowed = Date.distantPast
     var minSpacing: TimeInterval = 30
+    // True from the moment refresh() commits to fetching until it has published.
+    private var inFlight = false
 
     // Would a refresh right now actually send, or would the gate swallow it? The refresh
     // button asks before it calls, because a swallowed refresh returns without ever
@@ -199,11 +211,21 @@ final class UsageStore: ObservableObject {
     // window: if we're inside the spacing floor or a 429 cooldown, we defer to one
     // pending fire instead of sending.
     func refresh() async {
+        // One fetch at a time. `nextAllowed` spaces requests 30 s apart, which is
+        // longer than a healthy fetch takes — but the subprocess reads have their own
+        // (much longer) ceiling, so a Keychain prompt or a locked SQLite file can keep
+        // one alive past the gate. Without this, every trigger that arrived after the
+        // gate reopened would start a whole second fetch on top of the stuck one,
+        // each spawning another blocked child. Re-entrants return without scheduling
+        // a flush: the fetch already in flight is about to publish the same data.
+        guard !inFlight else { return }
         let now = self.now()
         if now < nextAllowed {
             scheduleFlush(at: nextAllowed)
             return
         }
+        inFlight = true
+        defer { inFlight = false }
         nextAllowed = now.addingTimeInterval(minSpacing)   // reserve this slot up front
         lastRefreshAt = now
         loading = true
@@ -407,18 +429,35 @@ final class UsageStore: ObservableObject {
 
 // MARK: - Process helper
 
-func runProcess(_ launchPath: String, _ args: [String]) -> String? {
+// Run a child and return its stdout, or nil if it failed or outstayed `timeout`.
+//
+// The timeout is not paranoia: `security find-generic-password` blocks for as long
+// as the Keychain permission dialog is up, and that dialog is the documented
+// first-launch step. Unbounded, a fetch that hits it never returns — `loading` stays
+// true and the refresh arrow spins forever. 60 s is far longer than a human needs to
+// click "Always Allow" and far shorter than forever.
+func runProcess(_ launchPath: String, _ args: [String], timeout: TimeInterval = 60) -> String? {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: launchPath)
     p.arguments = args
     let out = Pipe()
     p.standardOutput = out
-    p.standardError = Pipe()
+    // Discard stderr at the file-descriptor level rather than handing the child a
+    // Pipe nobody ever reads: once a child writes more than the pipe buffer (~64 KB)
+    // it blocks on the write, and `waitUntilExit()` below then blocks on it forever.
+    p.standardError = FileHandle.nullDevice
     do {
         try p.run()
     } catch { return nil }
+    // Fires only if the child is still alive at the deadline; cancelled on the
+    // normal path below, and no-ops if the process exits while it's in flight.
+    let watchdog = DispatchWorkItem { if p.isRunning { p.terminate() } }
+    DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
+    // Read before waiting: draining stdout is what lets the child finish writing and
+    // exit. Terminating it closes the pipe's write end, so this returns either way.
     let data = out.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
+    watchdog.cancel()
     guard p.terminationStatus == 0 else { return nil }
     return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
 }

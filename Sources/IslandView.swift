@@ -80,7 +80,7 @@ struct IslandView: View {
     @State private var cardShown = false         // card opacity gate — animated apart from layout
     @State private var loginEnabled = false     // reflects SMAppService login-item state
     @State private var draggingTool: Tool?      // the row being drag-reordered, if any
-    @State private var rowFrames: [UUID: CGRect] = [:]   // each row's slot, for drag hit-testing
+    @State private var rowFrames: [Tool.ID: CGRect] = [:]   // each row's slot, for drag hit-testing
 
     // At rest the tab is exactly the measured notch so it disappears into it.
     private var restTabWidth: CGFloat { state.hasNotch ? state.notchWidth : IslandSize.collapsedW }
@@ -847,8 +847,8 @@ struct RefreshButton: View {
 // Each provider row publishes its frame (in the card's "reorder" space) so the drag
 // gesture can tell which slot the pointer is hovering. Frames merge into one dict.
 struct RowFrameKey: PreferenceKey {
-    static var defaultValue: [UUID: CGRect] = [:]
-    static func reduce(value: inout [UUID: CGRect], nextValue: () -> [UUID: CGRect]) {
+    static var defaultValue: [Tool.ID: CGRect] = [:]
+    static func reduce(value: inout [Tool.ID: CGRect], nextValue: () -> [Tool.ID: CGRect]) {
         value.merge(nextValue()) { _, new in new }
     }
 }
