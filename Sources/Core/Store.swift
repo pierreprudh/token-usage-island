@@ -43,7 +43,25 @@ final class UsageStore: ObservableObject {
     // the highest one meant a weekly 18→21 crossing was invisible, and a session reset
     // flipping which metric is highest made the bucket lurch and eat real crossings.
     // The slot term disambiguates Codex primary/secondary when both share a label.
-    private var lastBucket: [String: Int] = [:]
+    //
+    // Persisted so bands crossed while the app is quit still fire on the first refresh
+    // after relaunch — in memory alone, every launch silently re-armed all buckets and
+    // ate those crossings. Persistence changes nothing about fetch cadence: detection
+    // still only reads whatever the throttled refreshes already fetched.
+    private static let bucketsKey = "milestoneBuckets"
+    private var lastBucket: [String: Int] =
+        (UserDefaults.standard.dictionary(forKey: UsageStore.bucketsKey) as? [String: Int]) ?? [:]
+
+    private func saveBuckets() {
+        UserDefaults.standard.set(lastBucket, forKey: Self.bucketsKey)
+    }
+
+    // Wipe both the in-memory bands and their persisted copy. A test seam: one
+    // run's crossings must not arm the next run's store.
+    func clearBuckets() {
+        lastBucket = [:]
+        UserDefaults.standard.removeObject(forKey: Self.bucketsKey)
+    }
 
     // Crossings waiting for their moment on the lip. Detection can turn up several at
     // once (two windows, two providers, or a refresh triggered by opening the card),
@@ -261,10 +279,11 @@ final class UsageStore: ObservableObject {
     // Fire a milestone when any usage window enters a higher 10% band. Every metric of
     // every tool is tracked independently, so the 5 h session and the weekly window each
     // get their own crossings; on a window reset the value drops and we just re-arm that
-    // band without firing. Several crossings in one refresh all get queued — the highest
-    // band leads, the rest follow, none are dropped.
+    // band without firing. Several crossings in one refresh all get queued — the metric
+    // that reached the highest band leads, the rest follow, none are dropped.
     func detectMilestone() {
-        var crossed: [MilestoneEvent] = []
+        var groups: [[MilestoneEvent]] = []
+        var armed = false
         for tool in tools {
             for m in tool.metrics {
                 guard let pct = m.percent else { continue }      // e.g. OpenCode's $ spend
@@ -274,15 +293,33 @@ final class UsageStore: ObservableObject {
                 let key = "\(tool.name)|\(m.label)|\(m.slot ?? "-")"
                 let bucket = Int(pct / 10) * 10
                 let prev = lastBucket[key]
-                lastBucket[key] = bucket
+                if prev != bucket { lastBucket[key] = bucket; armed = true }
                 guard let prev, bucket > prev, bucket > 0 else { continue }
-                crossed.append(MilestoneEvent(tool: tool.name, logoKey: tool.logoKey,
-                                              from: prev, bucket: bucket, percent: pct,
-                                              metricLabel: m.label))
+                // One beat per band: a 38→55 jump plays 40 then 50 rather than a single
+                // 30→50 blur, so no tens band ever skips its moment. Intermediate beats
+                // carry their band as the percent, so the tint and pulse match the band
+                // being announced rather than the tier the jump finally landed in.
+                var beats: [MilestoneEvent] = []
+                var from = prev
+                for band in stride(from: prev + 10, through: bucket, by: 10) {
+                    beats.append(MilestoneEvent(tool: tool.name, logoKey: tool.logoKey,
+                                                from: from, bucket: band,
+                                                percent: band == bucket ? pct : Double(band),
+                                                metricLabel: m.label))
+                    from = band
+                }
+                groups.append(beats)
             }
         }
-        guard !crossed.isEmpty else { return }
-        milestoneQueue += crossed.sorted { $0.bucket > $1.bucket }   // most urgent first
+        // Persist on every band movement, not just crossings — the first sighting and a
+        // reset re-arm must survive relaunch too, or the next launch re-arms and eats
+        // the crossings the persistence exists to keep.
+        if armed { saveBuckets() }
+        guard !groups.isEmpty else { return }
+        // The most urgent metric leads (highest band reached), but each metric's own
+        // beats stay ascending — a roll downwards would read as usage falling.
+        groups.sort { ($0.last?.bucket ?? 0) > ($1.last?.bucket ?? 0) }
+        milestoneQueue += groups.flatMap { $0 }
         if milestoneQueue.count > maxQueued {                        // drop the stalest
             milestoneQueue.removeFirst(milestoneQueue.count - maxQueued)
         }

@@ -42,16 +42,20 @@ final class MockFetcher: UsageFetcher {
 }
 
 // Build a UsageStore with deterministic timing, a fresh lastBucket, and no in-flight
-// throttle. The default initialiser reads from UserDefaults (tool order) and leaves
-// nextAllowed at .distantPast, which is what we want for the happy path. Tests that
-// exercise the gate override nextAllowed directly.
+// throttle. The default initialiser reads from UserDefaults (tool order, milestone
+// buckets) and leaves nextAllowed at .distantPast, which is what we want for the
+// happy path. Tests that exercise the gate override nextAllowed directly.
+// `freshBuckets: false` keeps the persisted bands — for tests that simulate relaunch.
 @MainActor
-func makeStore(fetcher: MockFetcher? = nil, now: Date = Date(timeIntervalSince1970: 1_700_000_000)) -> UsageStore {
+func makeStore(fetcher: MockFetcher? = nil, now: Date = Date(timeIntervalSince1970: 1_700_000_000),
+               freshBuckets: Bool = true) -> UsageStore {
     let store = UsageStore()
     store.now = { now }
     if let fetcher { store.fetcher = fetcher }
     // Make sure persisted order from a previous test run doesn't shuffle our tools.
     store.persistOrder()
+    // And persisted bands from a previous run (or test) don't arm this store.
+    if freshBuckets { store.clearBuckets() }
     return store
 }
 

@@ -293,6 +293,12 @@ struct IslandView: View {
             withAnimation(.easeInOut(duration: 0.75)) { launchBar = 1 }
             try? await Task.sleep(nanoseconds: 1_100_000_000)
             withAnimation(.spring(response: 0.40, dampingFraction: 0.72)) { state.launching = false }
+            // Crossings detected during the greeting were parked (the greeting owns the
+            // lip — see playMilestone's guard). Now that persisted buckets let the first
+            // refresh fire real crossings, this is the common case at launch: let the
+            // collapse settle, then hand the lip over.
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            store.resumeMilestones()
         }
     }
 
@@ -346,8 +352,11 @@ struct IslandView: View {
         // Card open (or QA reveal): the fresh number is already on screen, so don't fight
         // it — hand the crossing back to be replayed once the card closes. Opening the
         // card triggers a refresh, so this is the common case, and dropping it here is
-        // what made real crossings vanish without ever being shown.
-        guard !state.expanded, !state.forceReveal else {
+        // what made real crossings vanish without ever being shown. The launch greeting
+        // parks crossings the same way — persisted buckets mean the first refresh often
+        // fires while the greeting still owns the lip, and the milestone layer is
+        // invisible until `launching` clears (see playLaunchGreeting's hand-over).
+        guard !state.expanded, !state.forceReveal, !state.launching else {
             Task { @MainActor in store.milestoneDeferred(event) }
             return
         }
