@@ -58,66 +58,113 @@ func _fetchClaude(credentials: CredentialSource = DefaultCredentials()) async ->
 
 // MARK: - Codex (rate_limits events from the session logs)
 
-// One `rate_limits` object as Codex logs it, plus where and when it was seen.
+// One `rate_limits` object as Codex logs it, plus the context it was written in.
 //
-// Since Codex 0.155 a session can report more than one limit. The plan allowance —
-// the 5 h and weekly windows `/status` shows — is `limit_id: "codex"`; older logs
-// have no `limit_id` at all and mean the same thing. Alongside it, Codex Desktop
-// routes eligible Plus/Pro accounts onto "Luna Reserve", a separate allowance that
-// arrives as `limit_id: "base_model_inference"`, `limit_name: "gpt-reserve"`, with a
-// single weekly window and a null `secondary`. Once a session is on the reserve, the
-// plan bucket stops being written, so "the last rate_limits line" is no longer the
-// plan reading: it shipped as a bare "Weekly 0%" with the Session row gone.
+// Since Codex 0.155 a session can report more than one allowance. The plan — the 5 h
+// and weekly windows `/status` shows — and, on eligible Plus/Pro accounts, "Luna
+// Reserve": a fallback allowance with a single weekly window and a null `secondary`
+// that Codex Desktop routes a session onto once the plan runs low. Telling them apart
+// by `limit_id` alone does not work. The reserve arrived first as
+// `limit_id: "base_model_inference"`, `limit_name: "gpt-reserve"`; the same day, a
+// session whose turn model had been switched to `gpt-reserve` wrote reserve lines
+// tagged `limit_id: "codex"` with no `limit_name`. What is stable is the turn: the
+// `turn_context` event that opens a turn names its model, and every `rate_limits`
+// line until the next one belongs to that model. So a reading is the reserve when the
+// turn's model is `gpt-reserve`, or when the line itself says so; otherwise it is the
+// plan. Both mistakes shipped — first the reserve shown as a bare "Weekly 0%" with the
+// Session row gone (v1.4.1), then, filtering on the tag, its 12% displacing the plan
+// (v1.5.0).
 struct CodexRateLimit {
-    let bucket: String          // "codex", "base_model_inference", "premium", …
-    let name: String?           // limit_name — "gpt-reserve" for Luna Reserve
+    let bucket: String          // limit_id — "codex", "base_model_inference", "premium", …
+    let name: String?           // limit_name — "gpt-reserve" when the line says so itself
+    let model: String?          // the turn's model, nil when the window opened mid-turn
     let at: Date?               // the line's timestamp, nil on logs that lack one
     let raw: [String: Any]
 
-    var isPlan: Bool { bucket == "codex" }
+    var isReserve: Bool { model == "gpt-reserve" || name == "gpt-reserve" || bucket == "base_model_inference" }
+    var isPlan: Bool { bucket == "codex" && !isReserve }
+    // A `codex`-tagged line whose turn we did not see could be either. Every other
+    // combination is decided by the line itself.
+    var isAmbiguous: Bool { model == nil && bucket == "codex" && name == nil }
     var primary: [String: Any]? { raw["primary"] as? [String: Any] }
     var secondary: [String: Any]? { raw["secondary"] as? [String: Any] }
     var planType: String? { raw["plan_type"] as? String }
 }
 
-// Every `rate_limits` line in `text`, in file order. Lines that don't parse are
-// skipped — a truncated last line must not cost the reading.
+private let codexTurnTag = "\"type\":\"turn_context\""
+
+// Every `rate_limits` line in `text`, in file order, each tagged with the model of the
+// turn it was written in. Lines that don't parse are skipped — a truncated last line
+// must not cost the reading.
 func parseCodexRateLimits(_ text: String) -> [CodexRateLimit] {
     var out: [CodexRateLimit] = []
-    for line in text.split(separator: "\n") where line.contains("rate_limits") {
-        guard let d = line.data(using: .utf8),
+    var model: String?
+    for line in text.split(separator: "\n") {
+        if line.contains(codexTurnTag) {
+            if let d = line.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+               let payload = obj["payload"] as? [String: Any] {
+                model = payload["model"] as? String
+            }
+            continue
+        }
+        guard line.contains("rate_limits"),
+              let d = line.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: d),
               let rl = findKey("rate_limits", in: obj) as? [String: Any] else { continue }
         let ts = (obj as? [String: Any])?["timestamp"] as? String
         out.append(CodexRateLimit(bucket: rl["limit_id"] as? String ?? "codex",
                                   name: rl["limit_name"] as? String,
-                                  at: parseISO(ts), raw: rl))
+                                  model: model, at: parseISO(ts), raw: rl))
     }
     return out
+}
+
+// The readings of one session log, read from the tail, growing the window until it is
+// conclusive: every line in it is classifiable (a `turn_context` precedes the first
+// `codex`-tagged line, or the line decides itself), and, when `wantPlan`, it holds a
+// plan line. Or the whole file has been read. The common case — an active session on
+// the plan, last turn near the end — still costs a single 64 KB read; a session that
+// has spent its logged life on the reserve reads to its start once and comes back
+// without a plan line, which is the honest answer.
+func codexReadings(_ url: URL, wantPlan: Bool,
+                   from start: Int = 1 << 16, upTo limit: Int = 1 << 24) -> [CodexRateLimit]? {
+    let size = (try? FileManager.default.attributesOfItem(atPath: url.path))
+        .flatMap { $0[.size] as? Int } ?? 0
+    guard size > 0 else { return nil }
+    let ceiling = min(size, limit)
+    var window = min(start, size)
+    while true {
+        guard let text = tailOfFile(url, bytes: window) else { return nil }
+        let readings = parseCodexRateLimits(text)
+        let settled = !readings.isEmpty
+            && !readings.contains(where: \.isAmbiguous)
+            && (!wantPlan || readings.contains(where: \.isPlan))
+        if settled || window >= ceiling { return readings }
+        window = min(window * 4, ceiling)
+    }
 }
 
 func _fetchCodex(sessionsDir: String = Paths.codexSessions, now: Date = Date()) async -> Tool {
     var tool = Tool(name: "Codex", logoKey: "codex", accent: CODEX_ACCENT, metrics: [], subtitle: nil, failed: nil)
 
     let sessions = codexSessionsNewestFirst(in: sessionsDir)
-    guard let newest = sessions.first,
-          let content = tailContaining(newest, needle: "rate_limits") else {
+    guard let newest = sessions.first, let current = codexReadings(newest, wantPlan: true) else {
         tool.failed = "No Codex sessions."
         return tool
     }
-    let current = parseCodexRateLimits(content)
 
     // The plan reading. Usually in the current session; when that session has spent
     // its whole logged life on the reserve, the last plan line is in an earlier one,
     // so walk back. The walk is bounded — thirty sessions is weeks of use.
-    var plan = latestCodexPlanReading(in: newest, seen: current)
+    var plan = current.last(where: \.isPlan)
     if plan == nil {
         for url in sessions.dropFirst().prefix(30) {
-            if let hit = latestCodexPlanReading(in: url) { plan = hit; break }
+            if let hit = codexReadings(url, wantPlan: true)?.last(where: \.isPlan) { plan = hit; break }
         }
     }
     // The reserve only matters while the current session is drawing on it.
-    let reserve = current.last { !$0.isPlan && $0.primary != nil }
+    let reserve = current.last { $0.isReserve && $0.primary != nil }
 
     if let type = (plan ?? reserve)?.planType { tool.subtitle = type.capitalized + " plan" }
 
@@ -142,32 +189,12 @@ func _fetchCodex(sessionsDir: String = Paths.codexSessions, now: Date = Date()) 
         }
     }
     if let reserve, let primary = reserve.primary, let used = primary["used_percent"] as? Double {
-        let label = reserve.name == "gpt-reserve" ? "Reserve" : (reserve.name ?? reserve.bucket)
         let (pct, detail) = codexWindowReading(used: used, resetsAt: primary["resets_at"] as? Double,
                                                seenAt: reserve.at, now: now)
-        tool.metrics.append(Metric(label: label, percent: pct, detail: detail, slot: "reserve"))
+        tool.metrics.append(Metric(label: "Reserve", percent: pct, detail: detail, slot: "reserve"))
     }
     if tool.metrics.isEmpty { tool.failed = "No rate-limit data yet." }
     return tool
-}
-
-// Codex serialises compactly, so the plan bucket's tag is byte-stable in the log.
-private let codexPlanNeedle = "\"limit_id\":\"codex\""
-
-// The last plan-bucket line in `url`, or nil if the session never wrote one.
-//
-// The first pass is the cheap one: the tail that holds the newest `rate_limits` line,
-// which `seen` supplies when the caller has already read it. That is the whole answer
-// for legacy logs and for a session still on the plan. A session that has moved onto
-// the reserve fills that tail with reserve lines only, and the plan line it wrote
-// before switching sits megabytes deeper — the real 09/21 log had it 2.5 MB from EOF.
-// Growing towards the plan tag itself finds it in one more read; only a session that
-// was on the reserve from its first turn reads to the start and comes back empty.
-func latestCodexPlanReading(in url: URL, seen: [CodexRateLimit]? = nil) -> CodexRateLimit? {
-    let first = seen ?? (tailContaining(url, needle: "rate_limits").map(parseCodexRateLimits) ?? [])
-    if let hit = first.last(where: \.isPlan) { return hit }
-    guard !first.isEmpty, let deeper = tailContaining(url, needle: codexPlanNeedle) else { return nil }
-    return parseCodexRateLimits(deeper).last(where: \.isPlan)
 }
 
 // Percent and detail for one window, honest about the reading's age. A plan line can

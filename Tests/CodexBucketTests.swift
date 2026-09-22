@@ -17,6 +17,9 @@ struct CodexBucketTests {
         await passedResetReadsAsZeroNotAsTheStaleValue()
         await freshReadingCarriesNoAsOfSuffix()
         await bucketWithNullWindowsIsIgnored()
+        await reserveTaggedAsCodexUnderAReserveTurnIsStillTheReserve()
+        await windowOpeningMidReserveTurnDoesNotMistakeItForThePlan()
+        await weeklyOnlyPlanUnderAPlanModelStaysThePlan()
     }
 
     // Times: `now` is 22 Sept 2026 11:43 UTC — a day after the plan line, while the
@@ -36,6 +39,22 @@ struct CodexBucketTests {
     """
     static let legacyLine = """
     {"timestamp":"2026-09-16T21:30:29.483Z","type":"event_msg","payload":{"type":"token_count","info":{"rate_limits":{"primary":{"used_percent":3.0,"window_minutes":300,"resets_at":1790100000},"secondary":{"used_percent":91.0,"window_minutes":10080,"resets_at":1790601157},"plan_type":"plus"}}}}
+    """
+    // Cut from the 22 Sept 2026 session: the turn that opens on the reserve model, and
+    // the reserve line it writes — tagged `limit_id: "codex"`, no `limit_name`, one
+    // weekly window, null secondary. Indistinguishable from a weekly-only plan by tag.
+    static func turn(model: String, at ts: String) -> String {
+        """
+        {"timestamp":"\(ts)","ordinal":469,"type":"turn_context","payload":{"turn_id":"01a0c9","cwd":"/tmp","approval_policy":"on-request","model":"\(model)","effort":"medium"}}
+        """
+    }
+    static func codexTaggedReserveLine(at ts: String = "2026-09-22T15:51:15.458Z", used: Double = 12) -> String {
+        """
+        {"timestamp":"\(ts)","ordinal":600,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1},"rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":\(used),"window_minutes":10080,"resets_at":1790691400},"secondary":null,"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"individual_limit":null,"spend_control_reached":null,"plan_type":"plus","rate_limit_reached_type":null}}}}
+        """
+    }
+    static let planLineToday = """
+    {"timestamp":"2026-09-22T14:10:30.000Z","ordinal":459,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1},"rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":99.0,"window_minutes":300,"resets_at":1790102070},"secondary":{"used_percent":53.0,"window_minutes":10080,"resets_at":1790601157},"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"individual_limit":null,"spend_control_reached":null,"plan_type":"plus","rate_limit_reached_type":null}}}}
     """
     static let filler = "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"text\":\"" + String(repeating: "z", count: 300) + "\"}}"
 
@@ -170,5 +189,68 @@ struct CodexBucketTests {
 
         expectEqual(metric(tool, "reserve")?.label, "Reserve")
         expectEqual(tool.metrics.count, 3)
+    }
+
+    // The v1.5.0 regression. The plan ran out, Codex Desktop switched the turn model to
+    // gpt-reserve, and the reserve's lines came tagged `limit_id: "codex"`. Filtering
+    // on the tag showed the reserve's 12% as the plan and dropped the Session row.
+    // The turn's model decides.
+    static func reserveTaggedAsCodexUnderAReserveTurnIsStillTheReserve() async {
+        let now = Date(timeIntervalSince1970: 1_790_092_800)   // 22 Sept 16:00 UTC
+        guard let root = sessionsDir(files: [
+            ("22", [turn(model: "gpt-6-astra", at: "2026-09-22T13:34:30.049Z"), filler, planLineToday,
+                    premiumLine,
+                    turn(model: "gpt-reserve", at: "2026-09-22T14:16:29.000Z"), filler,
+                    codexTaggedReserveLine(used: 11), codexTaggedReserveLine(used: 12)], now),
+        ]) else { return }
+        defer { try? FileManager.default.removeItem(at: root) }
+        let tool = await _fetchCodex(sessionsDir: root.path, now: now)
+
+        expectEqual(metric(tool, "primary")?.label, "Session")
+        expectEqual(metric(tool, "primary")?.percent, 99)
+        expectEqual(metric(tool, "secondary")?.label, "Weekly")
+        expectEqual(metric(tool, "secondary")?.percent, 53)
+        expectEqual(metric(tool, "reserve")?.label, "Reserve")
+        expectEqual(metric(tool, "reserve")?.percent, 12)
+        expectEqual(tool.metrics.count, 3)
+    }
+
+    // A long reserve turn: the first 64 KB tail holds only codex-tagged reserve lines
+    // with no `turn_context` ahead of them, so they cannot be classified from the tail
+    // alone. The read must grow until the turn is in view rather than call them the plan.
+    static func windowOpeningMidReserveTurnDoesNotMistakeItForThePlan() async {
+        let now = Date(timeIntervalSince1970: 1_790_092_800)
+        var lines = [turn(model: "gpt-6-astra", at: "2026-09-22T13:34:30.049Z"), planLineToday,
+                     turn(model: "gpt-reserve", at: "2026-09-22T14:16:29.000Z")]
+        var bulk: [String] = []
+        while bulk.joined(separator: "\n").utf8.count < 200_000 {
+            bulk.append(filler); bulk.append(codexTaggedReserveLine(used: 5))
+        }
+        lines += bulk
+        lines.append(codexTaggedReserveLine(used: 12))
+        guard let root = sessionsDir(files: [("22", lines, now)]) else { return }
+        defer { try? FileManager.default.removeItem(at: root) }
+        let tool = await _fetchCodex(sessionsDir: root.path, now: now)
+
+        expectEqual(metric(tool, "primary")?.percent, 99, "plan must come from the plan turn, not a reserve line")
+        expectEqual(metric(tool, "secondary")?.percent, 53)
+        expectEqual(metric(tool, "reserve")?.percent, 12)
+    }
+
+    // Pro accounts have no 5 h gate: their plan is a single weekly window, the same
+    // shape as the reserve. Under a plan model it is the plan, and there is no reserve row.
+    static func weeklyOnlyPlanUnderAPlanModelStaysThePlan() async {
+        let now = Date(timeIntervalSince1970: 1_790_092_800)
+        guard let root = sessionsDir(files: [
+            ("22", [turn(model: "gpt-6-astra", at: "2026-09-22T15:50:00.000Z"), filler,
+                    codexTaggedReserveLine(used: 41)], now),
+        ]) else { return }
+        defer { try? FileManager.default.removeItem(at: root) }
+        let tool = await _fetchCodex(sessionsDir: root.path, now: now)
+
+        expectEqual(metric(tool, "primary")?.label, "Weekly")
+        expectEqual(metric(tool, "primary")?.percent, 41)
+        expectNil(metric(tool, "reserve"), "a weekly-only plan is not the reserve")
+        expectEqual(tool.metrics.count, 1)
     }
 }

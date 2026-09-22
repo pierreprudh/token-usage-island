@@ -212,9 +212,11 @@ values into `Casks/token-usage-island.rb` by hand.
 ## Notes
 
 - **Codex** reflects your most recent Codex session — its limits come from local logs, which
-  only update when Codex talks to its server. Codex reports the plan allowance
-  (`limit_id: codex`) and, on eligible Plus/Pro accounts, a separate Luna Reserve allowance
-  (`gpt-reserve`). The Session and Weekly rows always show the plan; Reserve gets its own row.
+  only update when Codex talks to its server. Codex reports the plan allowance and, on
+  eligible Plus/Pro accounts, a separate Luna Reserve allowance it falls back to once the
+  plan runs low. The two are told apart by the model of the turn that wrote each line
+  (`gpt-reserve` is the reserve), since Codex tags reserve lines inconsistently. The Session
+  and Weekly rows always show the plan; Reserve gets its own row.
   A session that has moved onto the reserve stops logging the plan, so the plan rows carry an
   `as of` time once they are over an hour old, and a window that has reset since reads 0%.
 - The Claude usage endpoint is rate-limited; a transient failure keeps the last good reading
