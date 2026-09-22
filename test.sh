@@ -26,6 +26,7 @@ if [ "${1:-}" != "--no-build" ]; then
         Sources/App/Appearance.swift Sources/App/IslandView.swift \
         Tests/TestRunner.swift Tests/TestSupport.swift \
         Tests/MilestoneTests.swift Tests/ThrottleTests.swift Tests/CodexTests.swift \
+        Tests/CodexBucketTests.swift \
         Tests/HoverTests.swift
 fi
 

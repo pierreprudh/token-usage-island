@@ -59,7 +59,7 @@ screen without a notch (where it falls back to a floating card).
 | Tool | Source | Metric |
 |------|--------|--------|
 | **Claude** | Live `GET /api/oauth/usage` (OAuth token from the Keychain) | Session (5 h) % + Weekly %, with reset times — the same data as `/usage` |
-| **Codex** | Latest `rate_limits` event in `~/.codex/sessions/**/*.jsonl` | Weekly % + plan, as of your last Codex run |
+| **Codex** | `rate_limits` events in `~/.codex/sessions/**/*.jsonl` | Session (5 h) % + Weekly % of the plan allowance, plus a Reserve row while a session draws on Luna Reserve — as of your last Codex run |
 | **OpenCode** | `~/.local/share/opencode/opencode.db` (SQLite) | Spend + tokens this week — pay-as-you-go, so no plan cap |
 
 ## Install
@@ -95,6 +95,7 @@ Claude  Team plan
   Weekly        █░░░░░░░░░░░░░░░░░░░  3%    Resets Sun 06:00
 
 Codex  Plus plan
+  Session       ███░░░░░░░░░░░░░░░░░  17%   Resets 20:15
   Weekly        ██░░░░░░░░░░░░░░░░░░  9%    Resets Sun 22:22
 
 OpenCode  pay-as-you-go
@@ -211,7 +212,11 @@ values into `Casks/token-usage-island.rb` by hand.
 ## Notes
 
 - **Codex** reflects your most recent Codex session — its limits come from local logs, which
-  only update when Codex talks to its server.
+  only update when Codex talks to its server. Codex reports the plan allowance
+  (`limit_id: codex`) and, on eligible Plus/Pro accounts, a separate Luna Reserve allowance
+  (`gpt-reserve`). The Session and Weekly rows always show the plan; Reserve gets its own row.
+  A session that has moved onto the reserve stops logging the plan, so the plan rows carry an
+  `as of` time once they are over an hour old, and a window that has reset since reads 0%.
 - The Claude usage endpoint is rate-limited; a transient failure keeps the last good reading
   instead of blanking, and shows `—` until data returns.
 

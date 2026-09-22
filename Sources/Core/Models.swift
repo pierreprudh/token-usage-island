@@ -115,18 +115,17 @@ func parseISO(_ s: String?) -> Date? {
     return isoFmt.date(from: s) ?? isoFmtNoFrac.date(from: s)
 }
 
-func resetDetail(_ date: Date?) -> String {
+func resetDetail(_ date: Date?, now: Date = Date()) -> String {
     guard let date else { return "" }
-    let now = Date()
-    let secs = date.timeIntervalSince(now)
-    if secs <= 0 { return "resetting…" }
+    if date.timeIntervalSince(now) <= 0 { return "resetting…" }
+    return "Resets \(clockDetail(date, now: now))"
+}
+
+// "17:45" within a day of `now`, "Mon 17:45" beyond — the same shape whether the
+// time is a reset ahead of us or a reading behind us.
+func clockDetail(_ date: Date, now: Date = Date()) -> String {
     let df = DateFormatter()
     df.locale = Locale.current
-    if secs < 24 * 3600 {
-        df.dateFormat = "HH:mm"
-        return "Resets \(df.string(from: date))"
-    } else {
-        df.dateFormat = "EEE HH:mm"
-        return "Resets \(df.string(from: date))"
-    }
+    df.dateFormat = abs(date.timeIntervalSince(now)) < 24 * 3600 ? "HH:mm" : "EEE HH:mm"
+    return df.string(from: date)
 }

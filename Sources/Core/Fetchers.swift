@@ -56,74 +56,151 @@ func _fetchClaude(credentials: CredentialSource = DefaultCredentials()) async ->
     return tool
 }
 
-// MARK: - Codex (last rate_limits from newest session log)
+// MARK: - Codex (rate_limits events from the session logs)
 
-func _fetchCodex() async -> Tool {
+// One `rate_limits` object as Codex logs it, plus where and when it was seen.
+//
+// Since Codex 0.155 a session can report more than one limit. The plan allowance —
+// the 5 h and weekly windows `/status` shows — is `limit_id: "codex"`; older logs
+// have no `limit_id` at all and mean the same thing. Alongside it, Codex Desktop
+// routes eligible Plus/Pro accounts onto "Luna Reserve", a separate allowance that
+// arrives as `limit_id: "base_model_inference"`, `limit_name: "gpt-reserve"`, with a
+// single weekly window and a null `secondary`. Once a session is on the reserve, the
+// plan bucket stops being written, so "the last rate_limits line" is no longer the
+// plan reading: it shipped as a bare "Weekly 0%" with the Session row gone.
+struct CodexRateLimit {
+    let bucket: String          // "codex", "base_model_inference", "premium", …
+    let name: String?           // limit_name — "gpt-reserve" for Luna Reserve
+    let at: Date?               // the line's timestamp, nil on logs that lack one
+    let raw: [String: Any]
+
+    var isPlan: Bool { bucket == "codex" }
+    var primary: [String: Any]? { raw["primary"] as? [String: Any] }
+    var secondary: [String: Any]? { raw["secondary"] as? [String: Any] }
+    var planType: String? { raw["plan_type"] as? String }
+}
+
+// Every `rate_limits` line in `text`, in file order. Lines that don't parse are
+// skipped — a truncated last line must not cost the reading.
+func parseCodexRateLimits(_ text: String) -> [CodexRateLimit] {
+    var out: [CodexRateLimit] = []
+    for line in text.split(separator: "\n") where line.contains("rate_limits") {
+        guard let d = line.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: d),
+              let rl = findKey("rate_limits", in: obj) as? [String: Any] else { continue }
+        let ts = (obj as? [String: Any])?["timestamp"] as? String
+        out.append(CodexRateLimit(bucket: rl["limit_id"] as? String ?? "codex",
+                                  name: rl["limit_name"] as? String,
+                                  at: parseISO(ts), raw: rl))
+    }
+    return out
+}
+
+func _fetchCodex(sessionsDir: String = Paths.codexSessions, now: Date = Date()) async -> Tool {
     var tool = Tool(name: "Codex", logoKey: "codex", accent: CODEX_ACCENT, metrics: [], subtitle: nil, failed: nil)
 
-    guard let fileURL = newestCodexSession(),
-          let content = tailContaining(fileURL, needle: "rate_limits") else {
+    let sessions = codexSessionsNewestFirst(in: sessionsDir)
+    guard let newest = sessions.first,
+          let content = tailContaining(newest, needle: "rate_limits") else {
         tool.failed = "No Codex sessions."
         return tool
     }
+    let current = parseCodexRateLimits(content)
 
-    // Find the LAST line containing rate_limits.
-    var lastRL: [String: Any]?
-    for line in content.split(separator: "\n") where line.contains("rate_limits") {
-        if let d = line.data(using: .utf8),
-           let obj = try? JSONSerialization.jsonObject(with: d),
-           let rl = findKey("rate_limits", in: obj) as? [String: Any] {
-            lastRL = rl
+    // The plan reading. Usually in the current session; when that session has spent
+    // its whole logged life on the reserve, the last plan line is in an earlier one,
+    // so walk back. The walk is bounded — thirty sessions is weeks of use.
+    var plan = latestCodexPlanReading(in: newest, seen: current)
+    if plan == nil {
+        for url in sessions.dropFirst().prefix(30) {
+            if let hit = latestCodexPlanReading(in: url) { plan = hit; break }
         }
     }
-    guard let rl = lastRL else {
-        tool.failed = "No rate-limit data yet."
-        return tool
-    }
-    if let plan = rl["plan_type"] as? String { tool.subtitle = plan.capitalized + " plan" }
+    // The reserve only matters while the current session is drawing on it.
+    let reserve = current.last { !$0.isPlan && $0.primary != nil }
 
-    if let primary = rl["primary"] as? [String: Any],
-       let used = primary["used_percent"] as? Double {
-        let window = primary["window_minutes"] as? Double ?? 0
-        let label = window >= 10080 ? "Weekly" : (window >= 300 ? "Session" : "Limit")
-        var detail = "as of last run"
-        if let resetEpoch = primary["resets_at"] as? Double {
-            detail = resetDetail(Date(timeIntervalSince1970: resetEpoch))
+    if let type = (plan ?? reserve)?.planType { tool.subtitle = type.capitalized + " plan" }
+
+    if let plan {
+        if let primary = plan.primary, let used = primary["used_percent"] as? Double {
+            let window = primary["window_minutes"] as? Double ?? 0
+            let label = window >= 10080 ? "Weekly" : (window >= 300 ? "Session" : "Limit")
+            let (pct, detail) = codexWindowReading(used: used, resetsAt: primary["resets_at"] as? Double,
+                                                   seenAt: plan.at, now: now)
+            // `slot` disambiguates the primary/secondary pair in the milestone bucket key
+            // when both happen to share a label (e.g. two weekly windows).
+            tool.metrics.append(Metric(label: label, percent: pct, detail: detail, slot: "primary"))
         }
-        // `slot` disambiguates the primary/secondary pair in the milestone bucket key
-        // when both happen to share a label (e.g. two weekly windows). The user-facing
-        // label is unchanged.
-        tool.metrics.append(Metric(label: label, percent: used, detail: detail, slot: "primary"))
+        if let secondary = plan.secondary, let used = secondary["used_percent"] as? Double {
+            // Name it by its window like `primary` does — "Secondary" told the milestone
+            // lip nothing, so a Codex weekly crossing showed a bare "20%" with no period tag.
+            let window = secondary["window_minutes"] as? Double ?? 0
+            let label = window >= 10080 ? "Weekly" : (window >= 300 ? "Session" : "Secondary")
+            let (pct, detail) = codexWindowReading(used: used, resetsAt: secondary["resets_at"] as? Double,
+                                                   seenAt: plan.at, now: now)
+            tool.metrics.append(Metric(label: label, percent: pct, detail: detail, slot: "secondary"))
+        }
     }
-    if let secondary = rl["secondary"] as? [String: Any],
-       let used = secondary["used_percent"] as? Double {
-        var detail = ""
-        if let resetEpoch = secondary["resets_at"] as? Double {
-            detail = resetDetail(Date(timeIntervalSince1970: resetEpoch))
-        }
-        // Name it by its window like `primary` does — "Secondary" told the milestone lip
-        // nothing, so a Codex weekly crossing showed a bare "20%" with no period tag.
-        let window = secondary["window_minutes"] as? Double ?? 0
-        let label = window >= 10080 ? "Weekly" : (window >= 300 ? "Session" : "Secondary")
-        tool.metrics.append(Metric(label: label, percent: used, detail: detail, slot: "secondary"))
+    if let reserve, let primary = reserve.primary, let used = primary["used_percent"] as? Double {
+        let label = reserve.name == "gpt-reserve" ? "Reserve" : (reserve.name ?? reserve.bucket)
+        let (pct, detail) = codexWindowReading(used: used, resetsAt: primary["resets_at"] as? Double,
+                                               seenAt: reserve.at, now: now)
+        tool.metrics.append(Metric(label: label, percent: pct, detail: detail, slot: "reserve"))
     }
     if tool.metrics.isEmpty { tool.failed = "No rate-limit data yet." }
     return tool
 }
 
-// Find newest .jsonl under the Codex sessions dir (sync — enumerator isn't async-safe).
-func newestCodexSession() -> URL? {
-    let fm = FileManager.default
-    guard let en = fm.enumerator(at: URL(fileURLWithPath: Paths.codexSessions),
-                                 includingPropertiesForKeys: [.contentModificationDateKey]) else {
-        return nil
+// Codex serialises compactly, so the plan bucket's tag is byte-stable in the log.
+private let codexPlanNeedle = "\"limit_id\":\"codex\""
+
+// The last plan-bucket line in `url`, or nil if the session never wrote one.
+//
+// The first pass is the cheap one: the tail that holds the newest `rate_limits` line,
+// which `seen` supplies when the caller has already read it. That is the whole answer
+// for legacy logs and for a session still on the plan. A session that has moved onto
+// the reserve fills that tail with reserve lines only, and the plan line it wrote
+// before switching sits megabytes deeper — the real 09/21 log had it 2.5 MB from EOF.
+// Growing towards the plan tag itself finds it in one more read; only a session that
+// was on the reserve from its first turn reads to the start and comes back empty.
+func latestCodexPlanReading(in url: URL, seen: [CodexRateLimit]? = nil) -> CodexRateLimit? {
+    let first = seen ?? (tailContaining(url, needle: "rate_limits").map(parseCodexRateLimits) ?? [])
+    if let hit = first.last(where: \.isPlan) { return hit }
+    guard !first.isEmpty, let deeper = tailContaining(url, needle: codexPlanNeedle) else { return nil }
+    return parseCodexRateLimits(deeper).last(where: \.isPlan)
+}
+
+// Percent and detail for one window, honest about the reading's age. A plan line can
+// be a day old once the session is on the reserve, and a 5 h window has rolled over by
+// then: showing its last 70% as current would be wrong, so a passed reset reads as 0%
+// and says why. A reading older than an hour whose window is still open keeps its
+// value and appends when it was taken. The " · " separator matters — the collapsed
+// lip shows only the text before the first one, so the reset time stays up front.
+func codexWindowReading(used: Double, resetsAt: Double?, seenAt: Date?, now: Date) -> (Double, String) {
+    guard let resetsAt else { return (used, seenAt.map { "as of " + clockDetail($0, now: now) } ?? "as of last run") }
+    let reset = Date(timeIntervalSince1970: resetsAt)
+    if reset <= now, let seenAt, seenAt < reset { return (0, "Reset since last run") }
+    var detail = resetDetail(reset, now: now)
+    if let seenAt, now.timeIntervalSince(seenAt) > 3600 {
+        detail += " · as of " + clockDetail(seenAt, now: now)
     }
-    var newest: (URL, Date)?
+    return (used, detail)
+}
+
+// Every .jsonl under the Codex sessions dir, newest modification first (sync — the
+// enumerator isn't async-safe).
+func codexSessionsNewestFirst(in dir: String) -> [URL] {
+    let fm = FileManager.default
+    guard let en = fm.enumerator(at: URL(fileURLWithPath: dir),
+                                 includingPropertiesForKeys: [.contentModificationDateKey]) else {
+        return []
+    }
+    var found: [(URL, Date)] = []
     for case let url as URL in en where url.pathExtension == "jsonl" {
         let d = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
-        if newest == nil || d > newest!.1 { newest = (url, d) }
+        found.append((url, d))
     }
-    return newest?.0
+    return found.sorted { $0.1 > $1.1 }.map(\.0)
 }
 
 // Read the tail of a file (default 64 KB) without slurping the whole thing. Codex
